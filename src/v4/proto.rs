@@ -146,6 +146,7 @@ pub enum Status {
     Dquot,
     Stale,
     Expired,
+    Grace,
     BadHandle,
     BadCookie,
     NotSupported,
@@ -164,6 +165,7 @@ pub enum Status {
     BadSession,
     AdminRevoked,
     SeqMisordered,
+    SeqFalseRetry,
     OpNotInSession,
     DeadSession,
     WrongType,
@@ -195,6 +197,7 @@ impl Status {
             69 => Self::Dquot,
             70 => Self::Stale,
             10011 => Self::Expired,
+            10013 => Self::Grace,
             10001 => Self::BadHandle,
             10003 => Self::BadCookie,
             10004 => Self::NotSupported,
@@ -213,6 +216,7 @@ impl Status {
             10052 => Self::BadSession,
             10047 => Self::AdminRevoked,
             10063 => Self::SeqMisordered,
+            10076 => Self::SeqFalseRetry,
             10071 => Self::OpNotInSession,
             10078 => Self::DeadSession,
             10083 => Self::WrongType,
@@ -244,6 +248,7 @@ impl Status {
             Self::Dquot => 69,
             Self::Stale => 70,
             Self::Expired => 10011,
+            Self::Grace => 10013,
             Self::BadHandle => 10001,
             Self::BadCookie => 10003,
             Self::NotSupported => 10004,
@@ -262,6 +267,7 @@ impl Status {
             Self::BadSession => 10052,
             Self::AdminRevoked => 10047,
             Self::SeqMisordered => 10063,
+            Self::SeqFalseRetry => 10076,
             Self::OpNotInSession => 10071,
             Self::DeadSession => 10078,
             Self::WrongType => 10083,
@@ -273,6 +279,11 @@ impl Status {
     /// Returns true for `NFS4_OK`.
     pub fn is_ok(self) -> bool {
         self == Self::Ok
+    }
+
+    /// Returns true when the same operation can be retried after a delay.
+    pub fn is_retryable(self) -> bool {
+        matches!(self, Self::Delay | Self::Grace) || self.requires_session_recovery()
     }
 
     /// Returns true when the client should create a new session and retry.
@@ -1208,11 +1219,11 @@ impl ChannelAttrs {
     pub fn back_channel_disabled() -> Self {
         Self {
             header_pad_size: 0,
-            max_request_size: 0,
-            max_response_size: 0,
-            max_response_size_cached: 0,
-            max_operations: 0,
-            max_requests: 0,
+            max_request_size: DEFAULT_SESSION_CHANNEL_SIZE,
+            max_response_size: DEFAULT_SESSION_CHANNEL_SIZE,
+            max_response_size_cached: DEFAULT_SESSION_CHANNEL_SIZE,
+            max_operations: 8,
+            max_requests: 1,
             rdma_ird: Vec::new(),
         }
     }
@@ -1559,6 +1570,9 @@ pub enum Operation {
     ExchangeId(ExchangeIdArgs),
     CreateSession(CreateSessionArgs),
     DestroySession(SessionId),
+    ReclaimComplete {
+        one_fs: bool,
+    },
     Sequence(SequenceArgs),
     PutRootFh,
     PutFh(FileHandle),
@@ -1630,6 +1644,7 @@ impl Operation {
             Self::ExchangeId(_) => OpCode::ExchangeId,
             Self::CreateSession(_) => OpCode::CreateSession,
             Self::DestroySession(_) => OpCode::DestroySession,
+            Self::ReclaimComplete { .. } => OpCode::ReclaimComplete,
             Self::Sequence(_) => OpCode::Sequence,
             Self::PutRootFh => OpCode::PutRootFh,
             Self::PutFh(_) => OpCode::PutFh,
@@ -1666,6 +1681,10 @@ impl Encode for Operation {
             Self::CreateSession(args) => args.encode(encoder),
             Self::DestroySession(session_id) => {
                 encoder.write_fixed_opaque(session_id);
+                Ok(())
+            }
+            Self::ReclaimComplete { one_fs } => {
+                encoder.write_bool(*one_fs);
                 Ok(())
             }
             Self::Sequence(args) => args.encode(encoder),
@@ -2350,5 +2369,16 @@ mod tests {
         assert_eq!(attrs.max_request_size, DEFAULT_SESSION_CHANNEL_SIZE);
         assert_eq!(attrs.max_response_size, DEFAULT_SESSION_CHANNEL_SIZE);
         assert_eq!(attrs.max_response_size_cached, DEFAULT_SESSION_CHANNEL_SIZE);
+    }
+
+    #[test]
+    fn back_channel_default_satisfies_linux_session_minimums() {
+        let attrs = ChannelAttrs::back_channel_disabled();
+
+        assert_eq!(attrs.max_request_size, DEFAULT_SESSION_CHANNEL_SIZE);
+        assert_eq!(attrs.max_response_size, DEFAULT_SESSION_CHANNEL_SIZE);
+        assert_eq!(attrs.max_response_size_cached, DEFAULT_SESSION_CHANNEL_SIZE);
+        assert!(attrs.max_operations > 0);
+        assert!(attrs.max_requests > 0);
     }
 }

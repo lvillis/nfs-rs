@@ -14,11 +14,11 @@ pub(crate) fn sequence_succeeded(response: &CompoundResponse) -> bool {
 }
 
 pub(crate) fn response_has_retryable_status(response: &CompoundResponse) -> bool {
-    response.status == Status::Delay
+    response.status.is_retryable()
         || response
             .results
             .iter()
-            .any(|result| result.status() == Status::Delay)
+            .any(|result| result.status().is_retryable())
 }
 
 pub(crate) fn response_requires_session_recovery(response: &CompoundResponse) -> bool {
@@ -510,13 +510,23 @@ mod tests {
     }
 
     #[test]
-    fn detects_retryable_delay_status() {
+    fn detects_retryable_delay_and_grace_statuses() {
         let response = CompoundResponse {
             status: Status::Delay,
             tag: String::new(),
             results: vec![OperationResult::StatusOnly {
                 op: OpCode::GetFh,
                 status: Status::Delay,
+            }],
+        };
+        assert!(response_has_retryable_status(&response));
+
+        let response = CompoundResponse {
+            status: Status::Grace,
+            tag: String::new(),
+            results: vec![OperationResult::StatusOnly {
+                op: OpCode::Open,
+                status: Status::Grace,
             }],
         };
         assert!(response_has_retryable_status(&response));

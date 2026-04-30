@@ -408,6 +408,15 @@ fn encodes_destroy_session_operation() {
 }
 
 #[test]
+fn encodes_reclaim_complete_operation() {
+    let bytes = to_bytes(&Operation::ReclaimComplete { one_fs: false }).unwrap();
+    let mut expected = Encoder::new();
+    expected.write_u32(58); // OP_RECLAIM_COMPLETE
+    expected.write_bool(false);
+    assert_eq!(bytes, expected.into_bytes());
+}
+
+#[test]
 fn encodes_access_operation() {
     let bytes = to_bytes(&Operation::Access(ACCESS4_READ | ACCESS4_LOOKUP)).unwrap();
     assert_eq!(

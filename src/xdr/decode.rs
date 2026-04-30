@@ -83,7 +83,7 @@ impl<'de> Decoder<'de> {
         self.read_i32()
     }
 
-    /// Reads fixed-length opaque data and validates XDR padding.
+    /// Reads fixed-length opaque data and skips XDR padding.
     pub fn read_fixed_opaque(&mut self, len: usize) -> Result<&'de [u8]> {
         let value = self.read_bytes(len)?;
         self.skip_padding(len)?;
@@ -165,10 +165,7 @@ impl<'de> Decoder<'de> {
 
     fn skip_padding(&mut self, len: usize) -> Result<()> {
         let padding = padding_len(len);
-        let bytes = self.read_bytes(padding)?;
-        if let Some(value) = bytes.iter().copied().find(|byte| *byte != 0) {
-            return Err(Error::InvalidPadding { value });
-        }
+        self.read_bytes(padding)?;
         Ok(())
     }
 }

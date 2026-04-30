@@ -112,12 +112,10 @@ fn rejects_lengths_above_declared_limit() {
 }
 
 #[test]
-fn rejects_non_zero_padding() {
+fn ignores_non_zero_padding_from_remote_peers() {
     let mut decoder = Decoder::new(&[0, 0, 0, 1, b'a', 0, 7, 0]);
-    assert_eq!(
-        decoder.read_opaque(8).unwrap_err(),
-        Error::InvalidPadding { value: 7 }
-    );
+    assert_eq!(decoder.read_opaque(8).unwrap(), b"a");
+    assert!(decoder.finish().is_ok());
 }
 
 #[test]

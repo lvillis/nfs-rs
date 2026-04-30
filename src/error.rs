@@ -145,20 +145,16 @@ impl Error {
 
     /// Returns true when retrying the operation may succeed.
     ///
-    /// This covers transient I/O failures, NFSv3 `Jukebox`, NFSv4 `Delay`, and
-    /// NFSv4 statuses that require session recovery.
+    /// This covers transient I/O failures, NFSv3 `Jukebox`, NFSv4 `Delay` or
+    /// `Grace`, and NFSv4 statuses that require session recovery.
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Io(err) => is_retryable_io_error(err.kind()),
             Self::Nfs {
                 status: crate::v3::NfsStatus::Jukebox,
                 ..
-            }
-            | Self::NfsV4 {
-                status: crate::v4::Status::Delay,
-                ..
             } => true,
-            Self::NfsV4 { status, .. } => status.requires_session_recovery(),
+            Self::NfsV4 { status, .. } => status.is_retryable(),
             _ => false,
         }
     }

@@ -1175,7 +1175,7 @@ impl Client {
 
     fn connect_with_builder(builder: ClientBuilder) -> Result<Self> {
         let mut client = Self::connect_session(builder)?;
-        client.refresh_root_fsinfo();
+        client.refresh_root_fsinfo()?;
         Ok(client)
     }
 
@@ -1234,12 +1234,29 @@ impl Client {
         session_res.ensure_ok()?;
         let session = response_create_session(&session_res)?;
 
+        let reclaim_res = raw_compound_with_rpc(
+            &mut rpc,
+            "reclaim-complete",
+            NFS4_MINOR_VERSION_LATEST,
+            vec![
+                Operation::Sequence(SequenceArgs {
+                    session_id: session.session_id,
+                    sequence_id: 1,
+                    slot_id: 0,
+                    highest_slot_id: 0,
+                    cache_this: false,
+                }),
+                Operation::ReclaimComplete { one_fs: false },
+            ],
+        )?;
+        reclaim_res.ensure_ok()?;
+
         let client = Self {
             rpc,
             builder: stored_builder,
             client_id: exchange.client_id,
             session_id: session.session_id,
-            sequence_id: 1,
+            sequence_id: 2,
             open_seqid: 1,
             open_owner: builder.open_owner.clone(),
             root_fsinfo: None,
@@ -1253,8 +1270,8 @@ impl Client {
         Ok(client)
     }
 
-    fn refresh_root_fsinfo(&mut self) {
-        self.root_fsinfo = self.fsinfo("/").ok();
+    fn refresh_root_fsinfo(&mut self) -> Result<()> {
+        self.root_fsinfo = Some(self.fsinfo("/")?);
         if let Some(fsinfo) = &self.root_fsinfo {
             self.read_size = clamp_io_size(fsinfo.max_read, self.builder.read_size);
             self.write_size = clamp_io_size(fsinfo.max_write, self.builder.write_size);
@@ -1264,6 +1281,7 @@ impl Client {
                 self.dir_size,
             ]));
         }
+        Ok(())
     }
 
     fn raw_compound(
@@ -1575,19 +1593,32 @@ fn raw_compound_with_rpc(
     minor_version: u32,
     operations: Vec<Operation>,
 ) -> Result<CompoundResponse> {
+    let tag = tag.into();
     let payload = rpc.call(
         NFS4_PROGRAM,
         NFS4_VERSION,
         1,
         &CompoundArgs {
-            tag: tag.into(),
+            tag: tag.clone(),
             minor_version,
             operations,
         },
     )?;
     let mut decoder = Decoder::new(&payload);
-    let response = CompoundResponse::decode(&mut decoder)?;
-    decoder.finish()?;
+    let response = CompoundResponse::decode(&mut decoder).map_err(|err| {
+        Error::Protocol(format!(
+            "failed to decode NFSv4 COMPOUND response for tag {tag:?} at byte {} of {}: {err}",
+            decoder.position(),
+            payload.len()
+        ))
+    })?;
+    decoder.finish().map_err(|err| {
+        Error::Protocol(format!(
+            "failed to finish NFSv4 COMPOUND response for tag {tag:?} at byte {} of {}: {err}",
+            decoder.position(),
+            payload.len()
+        ))
+    })?;
     Ok(response)
 }
 
