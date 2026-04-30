@@ -28,6 +28,19 @@ pub(crate) fn response_requires_session_recovery(response: &CompoundResponse) ->
     ) || (response.results.is_empty() && response.status.requires_session_recovery())
 }
 
+pub(crate) fn ensure_reclaim_complete(response: &CompoundResponse) -> Result<()> {
+    if matches!(response.status, Status::CompleteAlready)
+        || matches!(
+            response.results.last().map(OperationResult::status),
+            Some(Status::CompleteAlready)
+        )
+    {
+        Ok(())
+    } else {
+        response.ensure_ok()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SpaceOp {
     Allocate,
@@ -530,6 +543,29 @@ mod tests {
             }],
         };
         assert!(response_has_retryable_status(&response));
+    }
+
+    #[test]
+    fn accepts_reclaim_complete_already_during_session_setup() {
+        let complete_already = CompoundResponse {
+            status: Status::CompleteAlready,
+            tag: String::new(),
+            results: vec![OperationResult::StatusOnly {
+                op: OpCode::ReclaimComplete,
+                status: Status::CompleteAlready,
+            }],
+        };
+        assert!(ensure_reclaim_complete(&complete_already).is_ok());
+
+        let wrong_sec = CompoundResponse {
+            status: Status::WrongSec,
+            tag: String::new(),
+            results: vec![OperationResult::StatusOnly {
+                op: OpCode::ReclaimComplete,
+                status: Status::WrongSec,
+            }],
+        };
+        assert!(ensure_reclaim_complete(&wrong_sec).is_err());
     }
 
     #[test]

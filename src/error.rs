@@ -136,7 +136,12 @@ impl Error {
                 ..
             }
             | Self::NfsV4 {
-                status: crate::v4::Status::Perm | crate::v4::Status::Access,
+                status:
+                    crate::v4::Status::Perm
+                    | crate::v4::Status::Access
+                    | crate::v4::Status::PartnerNoAuth
+                    | crate::v4::Status::WrongCred
+                    | crate::v4::Status::WrongSec,
                 ..
             } => true,
             _ => false,
@@ -195,7 +200,9 @@ impl Error {
                 status: crate::v3::NfsStatus::Stale | crate::v3::NfsStatus::BadHandle,
                 ..
             } | Self::NfsV4 {
-                status: crate::v4::Status::Stale | crate::v4::Status::BadHandle,
+                status: crate::v4::Status::Stale
+                    | crate::v4::Status::BadHandle
+                    | crate::v4::Status::FhExpired,
                 ..
             }
         )

@@ -18,8 +18,8 @@ use crate::error::{Error, Result};
 use crate::retry::RetryPolicy;
 use crate::rpc::{Auth, AuthSys, RpcClient, max_record_size_for_payloads};
 use crate::v4::client::{
-    SpaceOp, advance_offset, dir_page_from_entries, ensure_last_status, finish_with_close,
-    join_path, path_components, path_ops, response_access, response_commit,
+    SpaceOp, advance_offset, dir_page_from_entries, ensure_last_status, ensure_reclaim_complete,
+    finish_with_close, join_path, path_components, path_ops, response_access, response_commit,
     response_create_session, response_exchange_id, response_getattr, response_getfh,
     response_has_retryable_status, response_open, response_read, response_readdir,
     response_readlink, response_requires_session_recovery, response_seek, response_write,
@@ -1205,7 +1205,7 @@ impl Client {
                 verifier: builder.client_owner_verifier,
                 owner_id: builder.owner_id.clone(),
             },
-            flags: 0x0001_0000, // EXCHGID4_FLAG_USE_NON_PNFS
+            flags: EXCHGID4_FLAG_USE_NON_PNFS,
         };
 
         let exchange_res = raw_compound_with_rpc(
@@ -1224,6 +1224,7 @@ impl Client {
             fore_channel_attrs: ChannelAttrs::fore_channel_default(),
             back_channel_attrs: ChannelAttrs::back_channel_disabled(),
             callback_program: 0,
+            callback_sec_parms: Vec::new(),
         };
         let session_res = raw_compound_with_rpc(
             &mut rpc,
@@ -1249,7 +1250,7 @@ impl Client {
                 Operation::ReclaimComplete { one_fs: false },
             ],
         )?;
-        reclaim_res.ensure_ok()?;
+        ensure_reclaim_complete(&reclaim_res)?;
 
         let client = Self {
             rpc,

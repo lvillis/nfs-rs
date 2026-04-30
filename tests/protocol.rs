@@ -97,6 +97,13 @@ fn classifies_operational_error_semantics() {
         }
         .is_permission_denied()
     );
+    assert!(
+        Error::NfsV4 {
+            operation: "READ",
+            status: Status::WrongSec,
+        }
+        .is_permission_denied()
+    );
 
     assert!(Error::Io(io::Error::from(io::ErrorKind::TimedOut)).is_retryable());
     assert!(
@@ -167,10 +174,17 @@ fn classifies_handle_and_v4_state_errors() {
         }
         .is_stale_handle()
     );
+    assert!(
+        Error::NfsV4 {
+            operation: "GETFH",
+            status: Status::FhExpired,
+        }
+        .is_stale_handle()
+    );
 
     let lost_state = Error::NfsV4 {
         operation: "READ",
-        status: Status::StaleStateId,
+        status: Status::DelegRevoked,
     };
     assert!(lost_state.is_lost_state());
     assert!(!lost_state.is_session_recoverable());
