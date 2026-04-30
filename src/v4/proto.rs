@@ -16,6 +16,8 @@ pub const NFS4_MAX_OPS: usize = 128;
 pub const NFS4_MAX_IO: usize = 64 * 1024 * 1024;
 pub const NFS4_MAX_DIR_ENTRIES: usize = 1_000_000;
 
+const DEFAULT_SESSION_CHANNEL_SIZE: u32 = 1024 * 1024;
+
 pub const FATTR4_SUPPORTED_ATTRS: u32 = 0;
 pub const FATTR4_TYPE: u32 = 1;
 pub const FATTR4_FH_EXPIRE_TYPE: u32 = 2;
@@ -1194,9 +1196,9 @@ impl ChannelAttrs {
     pub fn fore_channel_default() -> Self {
         Self {
             header_pad_size: 0,
-            max_request_size: 1024 * 1024,
-            max_response_size: 1024 * 1024,
-            max_response_size_cached: 0,
+            max_request_size: DEFAULT_SESSION_CHANNEL_SIZE,
+            max_response_size: DEFAULT_SESSION_CHANNEL_SIZE,
+            max_response_size_cached: DEFAULT_SESSION_CHANNEL_SIZE,
             max_operations: 64,
             max_requests: 1,
             rdma_ird: Vec::new(),
@@ -2335,4 +2337,18 @@ fn decode_session_id(decoder: &mut Decoder<'_>) -> crate::xdr::Result<SessionId>
             needed: NFS4_SESSIONID_SIZE,
             remaining: bytes.len(),
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fore_channel_default_advertises_cached_response_space() {
+        let attrs = ChannelAttrs::fore_channel_default();
+
+        assert_eq!(attrs.max_request_size, DEFAULT_SESSION_CHANNEL_SIZE);
+        assert_eq!(attrs.max_response_size, DEFAULT_SESSION_CHANNEL_SIZE);
+        assert_eq!(attrs.max_response_size_cached, DEFAULT_SESSION_CHANNEL_SIZE);
+    }
 }
