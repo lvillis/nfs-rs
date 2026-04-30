@@ -1,0 +1,42 @@
+name: NFS Live Tests
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  nfs-live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install 1.95.0 --profile minimal && rustup default 1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Start local NFS server
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nfs-kernel-server nfs-common rpcbind
+
+          sudo mkdir -p /srv/nfs-rs/export
+          sudo chmod 0777 /srv/nfs-rs/export
+
+          echo "/srv/nfs-rs/export 127.0.0.1(rw,sync,no_subtree_check,no_root_squash,fsid=0,insecure)" | sudo tee /etc/exports
+
+          sudo systemctl start rpcbind || sudo service rpcbind start
+          sudo systemctl restart nfs-kernel-server || sudo service nfs-kernel-server restart
+          sudo exportfs -rav
+
+          rpcinfo -p 127.0.0.1
+          showmount -e 127.0.0.1
+      - name: Run live NFSv3 and NFSv4 tests
+        env:
+          NFS_RS_V3_TARGET: 127.0.0.1:/srv/nfs-rs/export
+          NFS_RS_V4_HOST: 127.0.0.1
+          NFS_RS_TEST_PREFIX: /
+        run: cargo test --test live --all-features --locked -- --nocapture

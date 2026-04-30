@@ -1,0 +1,61 @@
+[package]
+name = "nfs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95.0"
+description = "A userspace NFSv3 and NFSv4 client library."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+documentation = "https://docs.rs/nfs"
+keywords = ["nfs", "nfsv3", "nfsv4", "storage", "client"]
+categories = ["filesystem", "network-programming"]
+
+[features]
+default = ["blocking"]
+blocking = []
+protocol = []
+tokio = ["dep:tokio"]
+
+[dependencies]
+libc = "0.2.186"
+tokio = { version = "1.52.1", optional = true, features = ["io-util", "macros", "net", "rt", "time"] }
+
+[[example]]
+name = "basic"
+path = "examples/basic.rs"
+required-features = ["blocking"]
+
+[[example]]
+name = "v3_cookbook"
+path = "examples/v3_cookbook.rs"
+required-features = ["blocking"]
+
+[[example]]
+name = "v4_basic"
+path = "examples/v4_basic.rs"
+required-features = ["blocking"]
+
+[[example]]
+name = "v4_cookbook"
+path = "examples/v4_cookbook.rs"
+required-features = ["blocking"]
+
+[[example]]
+name = "tokio_basic"
+path = "examples/tokio_basic.rs"
+required-features = ["tokio"]
+
+[[example]]
+name = "v3_tokio_cookbook"
+path = "examples/v3_tokio_cookbook.rs"
+required-features = ["tokio"]
+
+[[example]]
+name = "v4_tokio_basic"
+path = "examples/v4_tokio_basic.rs"
+required-features = ["tokio"]
+
+[[example]]
+name = "v4_tokio_cookbook"
+path = "examples/v4_tokio_cookbook.rs"
+required-features = ["tokio"]
