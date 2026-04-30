@@ -4,11 +4,18 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.95.0"
 description = "A userspace NFSv3 and NFSv4 client library."
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 readme = "README.md"
 documentation = "https://docs.rs/nfs"
 keywords = ["nfs", "nfsv3", "nfsv4", "storage", "client"]
 categories = ["filesystem", "network-programming"]
+include = [
+    "Cargo.toml",
+    "README.md",
+    "examples/**/*.rs",
+    "src/**/*.rs",
+    "tests/**/*.rs",
+]
 
 [features]
 default = ["blocking"]
