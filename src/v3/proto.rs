@@ -1739,6 +1739,24 @@ mod tests {
     }
 
     #[test]
+    fn decodes_optional_post_op_file_handles() {
+        let mut decoder = Decoder::new(&[0, 0, 0, 0]);
+        assert_eq!(decode_post_op_fh(&mut decoder).unwrap(), None);
+        decoder.finish().unwrap();
+
+        let mut decoder = Decoder::new(&[
+            0, 0, 0, 1, // present
+            0, 0, 0, 3, // opaque length
+            1, 2, 3, 0, // opaque data and padding
+        ]);
+        assert_eq!(
+            decode_post_op_fh(&mut decoder).unwrap(),
+            Some(FileHandle::new(vec![1, 2, 3]).unwrap())
+        );
+        decoder.finish().unwrap();
+    }
+
+    #[test]
     fn validates_read_result_size_against_request() {
         assert!(validate_read_result_size(8, 4, 4, false).is_ok());
         assert!(matches!(

@@ -1072,21 +1072,14 @@ impl Client {
                 status: NfsStatus::NoEnt,
                 ..
             }) => {
-                let (parent, name) = self.resolve_parent(path).await?;
-                self.nfs
-                    .create(
-                        &parent,
-                        &name,
-                        &CreateHow::Unchecked(SetAttr {
-                            mode: Some(0o644),
-                            ..SetAttr::default()
-                        }),
-                    )
-                    .await?
-                    .object
-                    .ok_or_else(|| {
-                        Error::Protocol("CREATE succeeded without returning a file handle".into())
-                    })?
+                self.create_handle_with_how(
+                    path,
+                    CreateHow::Unchecked(SetAttr {
+                        mode: Some(0o644),
+                        ..SetAttr::default()
+                    }),
+                )
+                .await?
             }
             Err(err) => return Err(err),
         };
@@ -1116,21 +1109,14 @@ impl Client {
                 status: NfsStatus::NoEnt,
                 ..
             }) => {
-                let (parent, name) = self.resolve_parent(path).await?;
-                self.nfs
-                    .create(
-                        &parent,
-                        &name,
-                        &CreateHow::Unchecked(SetAttr {
-                            mode: Some(0o644),
-                            ..SetAttr::default()
-                        }),
-                    )
-                    .await?
-                    .object
-                    .ok_or_else(|| {
-                        Error::Protocol("CREATE succeeded without returning a file handle".into())
-                    })?
+                self.create_handle_with_how(
+                    path,
+                    CreateHow::Unchecked(SetAttr {
+                        mode: Some(0o644),
+                        ..SetAttr::default()
+                    }),
+                )
+                .await?
             }
             Err(err) => return Err(err),
         };
@@ -1174,14 +1160,11 @@ impl Client {
         let temp = temporary_sibling_path(path)?;
         let mut created = false;
 
-        let result = match self.create_handle_new(&temp, mode).await {
-            Ok(handle) => {
-                created = true;
-                match self.write_handle_all(&handle, 0, data, stable).await {
-                    Ok(()) => self.rename(&temp, path).await,
-                    Err(err) => Err(err),
-                }
-            }
+        let result = match self.create_guarded_handle(&temp, mode, &mut created).await {
+            Ok(handle) => match self.write_handle_all(&handle, 0, data, stable).await {
+                Ok(()) => self.rename(&temp, path).await,
+                Err(err) => Err(err),
+            },
             Err(err) => Err(err),
         };
 
@@ -1243,17 +1226,14 @@ impl Client {
         let temp = temporary_sibling_path(path)?;
         let mut created = false;
 
-        let result = match self.create_handle_new(&temp, mode).await {
-            Ok(handle) => {
-                created = true;
-                match self.write_handle_from_reader(&handle, reader, stable).await {
-                    Ok(written) => match self.rename(&temp, path).await {
-                        Ok(()) => Ok(written),
-                        Err(err) => Err(err),
-                    },
+        let result = match self.create_guarded_handle(&temp, mode, &mut created).await {
+            Ok(handle) => match self.write_handle_from_reader(&handle, reader, stable).await {
+                Ok(written) => match self.rename(&temp, path).await {
+                    Ok(()) => Ok(written),
                     Err(err) => Err(err),
-                }
-            }
+                },
+                Err(err) => Err(err),
+            },
             Err(err) => Err(err),
         };
 
@@ -1388,21 +1368,14 @@ impl Client {
                 status: NfsStatus::NoEnt,
                 ..
             }) => {
-                let (parent, name) = self.resolve_parent(to).await?;
-                self.nfs
-                    .create(
-                        &parent,
-                        &name,
-                        &CreateHow::Unchecked(SetAttr {
-                            mode: Some(source_attr.mode & 0o7777),
-                            ..SetAttr::default()
-                        }),
-                    )
-                    .await?
-                    .object
-                    .ok_or_else(|| {
-                        Error::Protocol("CREATE succeeded without returning a file handle".into())
-                    })?
+                self.create_handle_with_how(
+                    to,
+                    CreateHow::Unchecked(SetAttr {
+                        mode: Some(source_attr.mode & 0o7777),
+                        ..SetAttr::default()
+                    }),
+                )
+                .await?
             }
             Err(err) => return Err(err),
         };
@@ -1434,19 +1407,16 @@ impl Client {
         let mut created = false;
 
         let result = match self
-            .create_handle_new(&temp, source_attr.mode & 0o7777)
+            .create_guarded_handle(&temp, source_attr.mode & 0o7777, &mut created)
             .await
         {
-            Ok(target) => {
-                created = true;
-                match self.copy_handles(&source, &target, stable).await {
-                    Ok(copied) => match self.rename(&temp, to).await {
-                        Ok(()) => Ok(copied),
-                        Err(err) => Err(err),
-                    },
+            Ok(target) => match self.copy_handles(&source, &target, stable).await {
+                Ok(copied) => match self.rename(&temp, to).await {
+                    Ok(()) => Ok(copied),
                     Err(err) => Err(err),
-                }
-            }
+                },
+                Err(err) => Err(err),
+            },
             Err(err) => Err(err),
         };
 
@@ -1485,16 +1455,41 @@ impl Client {
     }
 
     async fn create_handle_new(&mut self, path: &str, mode: u32) -> Result<FileHandle> {
-        self.create_handle_with_how(path, CreateHow::Guarded(SetAttr::mode(mode)))
-            .await
+        let mut created = false;
+        self.create_guarded_handle(path, mode, &mut created).await
     }
 
     async fn create_handle_with_how(&mut self, path: &str, how: CreateHow) -> Result<FileHandle> {
         let (parent, name) = self.resolve_parent(path).await?;
         let result = self.nfs.create(&parent, &name, &how).await?;
-        result
-            .object
-            .ok_or_else(|| Error::Protocol("CREATE succeeded without a file handle".into()))
+        self.handle_from_create_result(&parent, &name, result).await
+    }
+
+    async fn create_guarded_handle(
+        &mut self,
+        path: &str,
+        mode: u32,
+        created: &mut bool,
+    ) -> Result<FileHandle> {
+        let (parent, name) = self.resolve_parent(path).await?;
+        let result = self
+            .nfs
+            .create(&parent, &name, &CreateHow::Guarded(SetAttr::mode(mode)))
+            .await?;
+        *created = true;
+        self.handle_from_create_result(&parent, &name, result).await
+    }
+
+    async fn handle_from_create_result(
+        &mut self,
+        parent: &FileHandle,
+        name: &str,
+        result: CreateResult,
+    ) -> Result<FileHandle> {
+        match result.object {
+            Some(handle) => Ok(handle),
+            None => Ok(self.nfs.lookup(parent, name).await?.object),
+        }
     }
 
     async fn finish_with_temp_cleanup<T>(
@@ -1811,10 +1806,17 @@ impl Client {
         .await?;
         mount.set_timeout(builder.timeout);
         let mount_info = mount.mount(&builder.target.export).await?;
+        let cleanup_mount_context = "cleanup UMOUNT after failed NFSv3 connect";
 
         let nfs_port = match builder.nfs_port {
             Some(port) => {
-                validate_port("nfs_port", port)?;
+                if let Err(err) = validate_port("nfs_port", port) {
+                    return Err(cleanup_error(
+                        err,
+                        cleanup_mount_context,
+                        mount.unmount(&builder.target.export).await,
+                    ));
+                }
                 port
             }
             None => get_tcp_port_with_timeout(
@@ -1827,31 +1829,47 @@ impl Client {
             .unwrap_or(NFS_PORT),
         };
 
-        let mut nfs = Nfs3Client::connect_with_timeout(
+        let mut nfs = match Nfs3Client::connect_with_timeout(
             (builder.target.host.as_str(), nfs_port),
             builder.auth.clone(),
             builder.timeout,
         )
-        .await?;
+        .await
+        {
+            Ok(nfs) => nfs,
+            Err(err) => {
+                return Err(cleanup_error(
+                    err,
+                    cleanup_mount_context,
+                    mount.unmount(&builder.target.export).await,
+                ));
+            }
+        };
         nfs.set_timeout(builder.timeout);
         nfs.set_retry_policy(builder.retry_policy);
 
-        let fsinfo = nfs.fsinfo(&mount_info.file_handle).await.ok();
-        let read_size = fsinfo
-            .as_ref()
-            .map(|info| clamp_io_size(info.read_preferred, info.read_max, read_size_limit))
-            .unwrap_or(read_size_limit);
-        let write_size = fsinfo
-            .as_ref()
-            .map(|info| clamp_io_size(info.write_preferred, info.write_max, write_size_limit))
-            .unwrap_or(write_size_limit);
-        let dir_size = fsinfo
-            .as_ref()
-            .map(|info| clamp_dir_size(info.dir_preferred, dir_size_limit))
-            .unwrap_or(dir_size_limit);
-        nfs.set_max_record_size(max_record_size_for_payloads(&[
+        let fsinfo = match nfs.fsinfo(&mount_info.file_handle).await {
+            Ok(fsinfo) => fsinfo,
+            Err(err) => {
+                return Err(cleanup_error(
+                    err,
+                    cleanup_mount_context,
+                    mount.unmount(&builder.target.export).await,
+                ));
+            }
+        };
+        let read_size = clamp_io_size(fsinfo.read_preferred, fsinfo.read_max, read_size_limit);
+        let write_size = clamp_io_size(fsinfo.write_preferred, fsinfo.write_max, write_size_limit);
+        let dir_size = clamp_dir_size(fsinfo.dir_preferred, dir_size_limit);
+        if let Err(err) = nfs.set_max_record_size(max_record_size_for_payloads(&[
             read_size, write_size, dir_size,
-        ]))?;
+        ])) {
+            return Err(cleanup_error(
+                err,
+                cleanup_mount_context,
+                mount.unmount(&builder.target.export).await,
+            ));
+        }
 
         Ok(Self {
             builder: stored_builder,
@@ -1860,7 +1878,7 @@ impl Client {
             mount_port,
             root: mount_info.file_handle,
             nfs,
-            fsinfo,
+            fsinfo: Some(fsinfo),
             read_size,
             write_size,
             dir_size,

@@ -13,12 +13,49 @@ pub(crate) fn sequence_succeeded(response: &CompoundResponse) -> bool {
     )
 }
 
-pub(crate) fn response_has_retryable_status(response: &CompoundResponse) -> bool {
-    status_allows_delayed_retry(response.status)
-        || response
-            .results
+pub(crate) fn response_allows_delayed_retry(
+    operations: &[Operation],
+    response: &CompoundResponse,
+) -> bool {
+    response_allows_delayed_retry_after_leading_results(operations, response, 1)
+}
+
+pub(crate) fn response_allows_delayed_retry_without_sequence(
+    operations: &[Operation],
+    response: &CompoundResponse,
+) -> bool {
+    response_allows_delayed_retry_after_leading_results(operations, response, 0)
+}
+
+fn response_allows_delayed_retry_after_leading_results(
+    operations: &[Operation],
+    response: &CompoundResponse,
+    leading_result_count: usize,
+) -> bool {
+    let Some(retry_index) = first_delayed_retry_result_index(response) else {
+        return false;
+    };
+    if retry_index < leading_result_count {
+        return true;
+    }
+
+    let delayed_operation_index = retry_index - leading_result_count;
+    delayed_operation_index < operations.len()
+        && operations[..delayed_operation_index]
             .iter()
-            .any(|result| status_allows_delayed_retry(result.status()))
+            .all(operation_can_replay_after_successful_prefix)
+        && operation_can_retry_after_delayed_result(&operations[delayed_operation_index])
+}
+
+fn first_delayed_retry_result_index(response: &CompoundResponse) -> Option<usize> {
+    if response.results.is_empty() && status_allows_delayed_retry(response.status) {
+        return Some(0);
+    }
+
+    response
+        .results
+        .iter()
+        .position(|result| status_allows_delayed_retry(result.status()))
 }
 
 fn status_allows_delayed_retry(status: Status) -> bool {
@@ -49,10 +86,37 @@ pub(crate) fn response_consumed_owner_seqid(response: &CompoundResponse, op: OpC
         .any(|result| result.op_code() == op && owner_seqid_status_consumes(result.status()))
 }
 
+pub(crate) fn response_operation_has_delayed_status(
+    response: &CompoundResponse,
+    op: OpCode,
+) -> bool {
+    response
+        .results
+        .iter()
+        .any(|result| result.op_code() == op && status_allows_delayed_retry(result.status()))
+}
+
+pub(crate) fn response_operation_requires_session_recovery(
+    response: &CompoundResponse,
+    op: OpCode,
+) -> bool {
+    response
+        .results
+        .iter()
+        .any(|result| result.op_code() == op && result.status().requires_session_recovery())
+}
+
 fn owner_seqid_status_consumes(status: Status) -> bool {
     !matches!(
         status,
-        Status::BadSeqId | Status::Delay | Status::Grace | Status::StaleClientId
+        Status::BadSeqId
+            | Status::BadStateId
+            | Status::BadXdr
+            | Status::Moved
+            | Status::NoFileHandle
+            | Status::Resource
+            | Status::StaleClientId
+            | Status::StaleStateId
     )
 }
 
@@ -63,6 +127,13 @@ pub(crate) fn validate_compound_response_shape(
     expected: &[OpCode],
     response: &CompoundResponse,
 ) -> Result<()> {
+    if response.tag != tag {
+        return Err(Error::Protocol(format!(
+            "NFSv4 COMPOUND response tag {:?} does not match request tag {tag:?}",
+            response.tag
+        )));
+    }
+
     if response.results.len() > expected.len() {
         return Err(Error::Protocol(format!(
             "NFSv4 COMPOUND {tag:?} returned {} operation results for {} requests",
@@ -213,6 +284,96 @@ fn operation_can_replay_after_session_recovery(operation: &Operation) -> bool {
         | Operation::Renew(_)
         | Operation::ReleaseLockOwner(_) => false,
     }
+}
+
+fn operation_can_replay_after_successful_prefix(operation: &Operation) -> bool {
+    match operation {
+        Operation::PutRootFh
+        | Operation::PutPubFh
+        | Operation::PutFh(_)
+        | Operation::Lookup(_)
+        | Operation::Lookupp
+        | Operation::Access(_)
+        | Operation::SecInfo(_)
+        | Operation::SecInfoNoName(_)
+        | Operation::NVerify(_)
+        | Operation::GetFh
+        | Operation::GetAttr(_)
+        | Operation::Read { .. }
+        | Operation::ReadDir { .. }
+        | Operation::ReadLink
+        | Operation::ReadPlus(_)
+        | Operation::Seek { .. }
+        | Operation::Verify(_)
+        | Operation::SaveFh
+        | Operation::RestoreFh
+        | Operation::LockTest(_)
+        | Operation::GetDeviceInfo(_)
+        | Operation::GetDeviceList(_)
+        | Operation::OffloadStatus(_) => true,
+        Operation::Write { .. }
+        | Operation::Commit { .. }
+        | Operation::SetAttr { .. }
+        | Operation::Remove(_)
+        | Operation::Link(_)
+        | Operation::Rename { .. }
+        | Operation::Create(_)
+        | Operation::SetClientId(_)
+        | Operation::SetClientIdConfirm(_)
+        | Operation::ExchangeId(_)
+        | Operation::CreateSession(_)
+        | Operation::BackchannelCtl(_)
+        | Operation::BindConnToSession(_)
+        | Operation::DestroySession(_)
+        | Operation::DestroyClientId(_)
+        | Operation::ReclaimComplete { .. }
+        | Operation::Sequence(_)
+        | Operation::DelegPurge(_)
+        | Operation::DelegReturn(_)
+        | Operation::Open(_)
+        | Operation::OpenAttr { .. }
+        | Operation::OpenConfirm { .. }
+        | Operation::Close { .. }
+        | Operation::Lock(_)
+        | Operation::LockUnlock(_)
+        | Operation::OpenDowngrade { .. }
+        | Operation::FreeStateId(_)
+        | Operation::TestStateIds(_)
+        | Operation::GetDirDelegation(_)
+        | Operation::LayoutCommit(_)
+        | Operation::LayoutGet(_)
+        | Operation::LayoutReturn(_)
+        | Operation::SetSsv(_)
+        | Operation::WantDelegation(_)
+        | Operation::Allocate { .. }
+        | Operation::Deallocate { .. }
+        | Operation::IoAdvise(_)
+        | Operation::Copy(_)
+        | Operation::CopyNotify(_)
+        | Operation::LayoutError(_)
+        | Operation::LayoutStats(_)
+        | Operation::OffloadCancel(_)
+        | Operation::Clone(_)
+        | Operation::WriteSame(_)
+        | Operation::Renew(_)
+        | Operation::ReleaseLockOwner(_) => false,
+    }
+}
+
+fn operation_can_retry_after_delayed_result(operation: &Operation) -> bool {
+    // RFC 7530 requires state-owner seqids to advance on most errors,
+    // including DELAY/GRACE. Those operations must be rebuilt by their caller
+    // instead of being replayed inside the generic COMPOUND retry loop.
+    !matches!(
+        operation,
+        Operation::Open(_)
+            | Operation::OpenConfirm { .. }
+            | Operation::Close { .. }
+            | Operation::Lock(_)
+            | Operation::LockUnlock(_)
+            | Operation::OpenDowngrade { .. }
+            | Operation::Sequence(_)
+    )
 }
 
 pub(crate) fn ensure_reclaim_complete(response: &CompoundResponse) -> Result<()> {
@@ -936,6 +1097,45 @@ mod tests {
             }],
         };
         assert!(!response_consumed_owner_seqid(&bad_seqid, OpCode::Close));
+
+        for status in [
+            Status::StaleClientId,
+            Status::StaleStateId,
+            Status::BadStateId,
+            Status::BadSeqId,
+            Status::BadXdr,
+            Status::Resource,
+            Status::NoFileHandle,
+            Status::Moved,
+        ] {
+            let response = CompoundResponse {
+                status,
+                tag: String::new(),
+                results: vec![OperationResult::Open {
+                    status,
+                    result: None,
+                }],
+            };
+            assert!(
+                !response_consumed_owner_seqid(&response, OpCode::Open),
+                "{status:?} must not advance the open-owner seqid"
+            );
+        }
+
+        for status in [Status::Delay, Status::Grace] {
+            let response = CompoundResponse {
+                status,
+                tag: String::new(),
+                results: vec![OperationResult::Open {
+                    status,
+                    result: None,
+                }],
+            };
+            assert!(
+                response_consumed_owner_seqid(&response, OpCode::Open),
+                "{status:?} must advance the open-owner seqid"
+            );
+        }
     }
 
     #[test]
@@ -957,7 +1157,7 @@ mod tests {
                 status: Status::Delay,
             }],
         };
-        assert!(response_has_retryable_status(&response));
+        assert_eq!(first_delayed_retry_result_index(&response), Some(0));
 
         let response = CompoundResponse {
             status: Status::Grace,
@@ -967,7 +1167,118 @@ mod tests {
                 status: Status::Grace,
             }],
         };
-        assert!(response_has_retryable_status(&response));
+        assert_eq!(first_delayed_retry_result_index(&response), Some(0));
+    }
+
+    #[test]
+    fn delayed_retry_requires_replayable_successful_prefix() {
+        let handle = FileHandle::new(vec![1]).unwrap();
+        let write_delay = CompoundResponse {
+            status: Status::Delay,
+            tag: String::new(),
+            results: vec![
+                sequence_ok_result(),
+                OperationResult::StatusOnly {
+                    op: OpCode::PutFh,
+                    status: Status::Ok,
+                },
+                OperationResult::Write {
+                    status: Status::Delay,
+                    result: None,
+                },
+            ],
+        };
+        assert!(response_allows_delayed_retry(
+            &[
+                Operation::PutFh(handle.clone()),
+                Operation::Write {
+                    stateid: StateId::anonymous(),
+                    offset: 0,
+                    stable: StableHow::FileSync,
+                    data: b"abc".to_vec(),
+                },
+            ],
+            &write_delay
+        ));
+
+        let open_then_getfh_delay = CompoundResponse {
+            status: Status::Delay,
+            tag: String::new(),
+            results: vec![
+                sequence_ok_result(),
+                OperationResult::Open {
+                    status: Status::Ok,
+                    result: Some(OpenResult {
+                        stateid: StateId::anonymous(),
+                        result_flags: 0,
+                        attrset: Bitmap::empty(),
+                        delegation: OpenDelegation::None,
+                    }),
+                },
+                OperationResult::GetFh {
+                    status: Status::Delay,
+                    handle: None,
+                },
+            ],
+        };
+        assert!(!response_allows_delayed_retry(
+            &[Operation::Open(open_args("file.txt")), Operation::GetFh,],
+            &open_then_getfh_delay
+        ));
+
+        let open_delay = CompoundResponse {
+            status: Status::Delay,
+            tag: String::new(),
+            results: vec![
+                sequence_ok_result(),
+                OperationResult::Open {
+                    status: Status::Delay,
+                    result: None,
+                },
+            ],
+        };
+        assert!(!response_allows_delayed_retry(
+            &[Operation::Open(open_args("file.txt"))],
+            &open_delay
+        ));
+        assert!(response_operation_has_delayed_status(
+            &open_delay,
+            OpCode::Open
+        ));
+
+        let sequence_delay = CompoundResponse {
+            status: Status::Delay,
+            tag: String::new(),
+            results: vec![OperationResult::Sequence {
+                status: Status::Delay,
+                result: None,
+            }],
+        };
+        assert!(response_allows_delayed_retry(
+            &[Operation::Remove("file.txt".to_owned())],
+            &sequence_delay
+        ));
+
+        let raw_create_session_delay = CompoundResponse {
+            status: Status::Delay,
+            tag: String::new(),
+            results: vec![OperationResult::CreateSession {
+                status: Status::Delay,
+                result: None,
+            }],
+        };
+        assert!(response_allows_delayed_retry_without_sequence(
+            &[Operation::CreateSession(CreateSessionArgs {
+                client_id: 1,
+                sequence_id: 1,
+                flags: 0,
+                fore_channel_attrs: ChannelAttrs::fore_channel_default(),
+                back_channel_attrs: ChannelAttrs::back_channel_disabled(),
+                callback_program: 0,
+                callback_sec_parms: Vec::new(),
+            })],
+            &raw_create_session_delay
+        ));
     }
 
     #[test]
@@ -980,7 +1291,7 @@ mod tests {
                 result: None,
             }],
         };
-        assert!(!response_has_retryable_status(&failed_sequence));
+        assert_eq!(first_delayed_retry_result_index(&failed_sequence), None);
         assert!(response_requires_session_recovery(&failed_sequence));
 
         let failed_later_operation = CompoundResponse {
@@ -1004,8 +1315,19 @@ mod tests {
                 },
             ],
         };
-        assert!(!response_has_retryable_status(&failed_later_operation));
+        assert_eq!(
+            first_delayed_retry_result_index(&failed_later_operation),
+            None
+        );
         assert!(!response_requires_session_recovery(&failed_later_operation));
+        assert!(response_operation_requires_session_recovery(
+            &failed_later_operation,
+            OpCode::GetFh
+        ));
+        assert!(!response_operation_requires_session_recovery(
+            &failed_later_operation,
+            OpCode::Open
+        ));
     }
 
     #[test]
@@ -1102,7 +1424,7 @@ mod tests {
     fn validates_compound_response_shape_and_order() {
         let ok = CompoundResponse {
             status: Status::Ok,
-            tag: String::new(),
+            tag: "read".to_owned(),
             results: vec![
                 OperationResult::Sequence {
                     status: Status::Ok,
@@ -1138,7 +1460,7 @@ mod tests {
 
         let too_many = CompoundResponse {
             status: Status::Ok,
-            tag: String::new(),
+            tag: "getfh".to_owned(),
             results: vec![
                 OperationResult::StatusOnly {
                     op: OpCode::PutRootFh,
@@ -1157,7 +1479,7 @@ mod tests {
 
         let short_success = CompoundResponse {
             status: Status::Ok,
-            tag: String::new(),
+            tag: "getattr".to_owned(),
             results: vec![OperationResult::StatusOnly {
                 op: OpCode::PutRootFh,
                 status: Status::Ok,
@@ -1174,7 +1496,7 @@ mod tests {
 
         let failed_lookup = CompoundResponse {
             status: Status::NoEnt,
-            tag: String::new(),
+            tag: "lookup".to_owned(),
             results: vec![
                 OperationResult::Sequence {
                     status: Status::Ok,
@@ -1197,7 +1519,7 @@ mod tests {
 
         let failed_with_ok_results = CompoundResponse {
             status: Status::NoEnt,
-            tag: String::new(),
+            tag: "lookup".to_owned(),
             results: vec![OperationResult::StatusOnly {
                 op: OpCode::Lookup,
                 status: Status::Ok,
@@ -1207,13 +1529,26 @@ mod tests {
             validate_compound_response_shape("lookup", &[OpCode::Lookup], &failed_with_ok_results),
             Err(Error::Protocol(_))
         ));
+
+        let wrong_tag = CompoundResponse {
+            status: Status::Ok,
+            tag: "other".to_owned(),
+            results: vec![OperationResult::StatusOnly {
+                op: OpCode::PutRootFh,
+                status: Status::Ok,
+            }],
+        };
+        assert!(matches!(
+            validate_compound_response_shape("expected", &[OpCode::PutRootFh], &wrong_tag),
+            Err(Error::Protocol(_))
+        ));
     }
 
     #[test]
     fn accepts_spec_illegal_result_for_unsupported_operation() {
         let response = CompoundResponse {
             status: Status::OpIllegal,
-            tag: String::new(),
+            tag: "unsupported".to_owned(),
             results: vec![
                 OperationResult::Sequence {
                     status: Status::Ok,
@@ -1237,7 +1572,7 @@ mod tests {
 
         let response = CompoundResponse {
             status: Status::BadXdr,
-            tag: String::new(),
+            tag: "bad".to_owned(),
             results: vec![OperationResult::StatusOnly {
                 op: OpCode::Illegal,
                 status: Status::BadXdr,
@@ -1496,6 +1831,34 @@ mod tests {
                     verifier: [0; NFS4_VERIFIER_SIZE],
                 }),
             }],
+        }
+    }
+
+    fn sequence_ok_result() -> OperationResult {
+        OperationResult::Sequence {
+            status: Status::Ok,
+            result: Some(SequenceResult {
+                session_id: [1; NFS4_SESSIONID_SIZE],
+                sequence_id: 1,
+                slot_id: 0,
+                highest_slot_id: 0,
+                target_highest_slot_id: 0,
+                status_flags: 0,
+            }),
+        }
+    }
+
+    fn open_args(name: &str) -> OpenArgs {
+        OpenArgs {
+            seqid: 1,
+            share_access: OPEN4_SHARE_ACCESS_READ,
+            share_deny: OPEN4_SHARE_DENY_NONE,
+            owner: OpenOwner {
+                client_id: 1,
+                owner: b"owner".to_vec(),
+            },
+            openhow: OpenHow::NoCreate,
+            claim: OpenClaim::Null(name.to_owned()),
         }
     }
 }

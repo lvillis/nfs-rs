@@ -27,13 +27,15 @@ use crate::v4::client::{
     SpaceOp, advance_offset, attrs_require_open_state, cleanup_error, dir_page_from_entries,
     ensure_distinct_copy_handles, ensure_last_status, ensure_reclaim_complete, finish_with_close,
     join_path, next_dir_cursor, open_cleanup_error, operations_can_replay_after_session_recovery,
-    path_components, path_ops, response_access, response_commit, response_consumed_owner_seqid,
-    response_create_session, response_exchange_id, response_getattr, response_getfh,
-    response_has_retryable_status, response_open, response_read, response_readdir,
-    response_readlink, response_requires_session_recovery, response_seek, response_write,
-    sequence_succeeded, session_max_operations, session_payload_limit, session_recovery_error,
-    split_parent, temporary_sibling_path, validate_compound_response_shape, validate_open_result,
-    validate_session_channel_attrs, validate_session_compound_operation_count, verifier_from_time,
+    path_components, path_ops, response_access, response_allows_delayed_retry,
+    response_allows_delayed_retry_without_sequence, response_commit, response_consumed_owner_seqid,
+    response_create_session, response_exchange_id, response_getattr, response_getfh, response_open,
+    response_operation_has_delayed_status, response_operation_requires_session_recovery,
+    response_read, response_readdir, response_readlink, response_requires_session_recovery,
+    response_seek, response_write, sequence_succeeded, session_max_operations,
+    session_payload_limit, session_recovery_error, split_parent, temporary_sibling_path,
+    validate_compound_response_shape, validate_open_result, validate_session_channel_attrs,
+    validate_session_compound_operation_count, verifier_from_time,
 };
 use crate::v4::proto::*;
 use crate::v4::{
@@ -296,6 +298,11 @@ impl Client {
     }
 
     pub async fn reconnect(&mut self) -> Result<()> {
+        self.recover_session().await?;
+        self.refresh_root_fsinfo().await
+    }
+
+    async fn recover_session(&mut self) -> Result<()> {
         let previous_client_id = self.client_id;
         let previous_open_seqid = self.open_seqid;
         let previous_root_fsinfo = self.root_fsinfo.clone();
@@ -308,7 +315,8 @@ impl Client {
             rebuilt.apply_fsinfo_limits(&fsinfo)?;
             rebuilt.root_fsinfo = Some(fsinfo);
         }
-        *self = rebuilt;
+        let old = std::mem::replace(self, rebuilt);
+        let _ = old.shutdown().await;
         Ok(())
     }
 
@@ -564,7 +572,7 @@ impl Client {
         let mut created = false;
 
         let result = match self
-            .open(
+            .open_temp(
                 &temp,
                 OPEN4_SHARE_ACCESS_BOTH,
                 OpenHow::Guarded(Fattr::mode(mode)),
@@ -611,7 +619,7 @@ impl Client {
         let mut created = false;
 
         let result = match self
-            .open(
+            .open_temp(
                 &temp,
                 OPEN4_SHARE_ACCESS_BOTH,
                 OpenHow::Guarded(Fattr::mode(mode)),
@@ -842,7 +850,7 @@ impl Client {
             .open(from, OPEN4_SHARE_ACCESS_READ, OpenHow::NoCreate)
             .await?;
         let target = match self
-            .open(
+            .open_temp(
                 &temp,
                 OPEN4_SHARE_ACCESS_BOTH,
                 OpenHow::Guarded(Fattr::mode(mode)),
@@ -1257,14 +1265,14 @@ impl Client {
             }
             if response_requires_session_recovery(&response) && !recovered_session {
                 let err = session_recovery_error(&response);
-                self.reconnect().await?;
+                self.recover_session().await?;
                 recovered_session = true;
                 if !can_replay_after_session_recovery {
                     return Err(err);
                 }
                 continue;
             }
-            if response_has_retryable_status(&response)
+            if response_allows_delayed_retry(&operations, &response)
                 && let Some(delay) = self.retry_policy.delay_for_retry(retry)
             {
                 retry += 1;
@@ -1277,7 +1285,13 @@ impl Client {
 
     async fn connect_with_builder(builder: ClientBuilder) -> Result<Self> {
         let mut client = Self::connect_session(builder).await?;
-        client.refresh_root_fsinfo().await?;
+        if let Err(err) = client.refresh_root_fsinfo().await {
+            return Err(cleanup_error(
+                err,
+                "cleanup DESTROY_SESSION after failed NFSv4 connect",
+                client.shutdown().await,
+            ));
+        }
         Ok(client)
     }
 
@@ -1330,11 +1344,12 @@ impl Client {
             },
             flags: EXCHGID4_FLAG_USE_NON_PNFS,
         };
-        let exchange_res = raw_compound_with_rpc(
+        let exchange_res = raw_compound_with_delayed_retry(
             &mut rpc,
             "exchange-id",
             minor_version,
             vec![Operation::ExchangeId(exchange)],
+            builder.retry_policy,
         )
         .await?;
         exchange_res.ensure_ok()?;
@@ -1349,45 +1364,77 @@ impl Client {
             callback_program: 0,
             callback_sec_parms: Vec::new(),
         };
-        let session_res = raw_compound_with_rpc(
+        let session_res = raw_compound_with_delayed_retry(
             &mut rpc,
             "create-session",
             minor_version,
             vec![Operation::CreateSession(create_session)],
+            builder.retry_policy,
         )
         .await?;
         session_res.ensure_ok()?;
         let session = response_create_session(&session_res)?;
-        validate_session_channel_attrs(&session.fore_channel_attrs)?;
-        let max_operations = session_max_operations(&session.fore_channel_attrs)?;
+        if let Err(err) = validate_session_channel_attrs(&session.fore_channel_attrs) {
+            return Err(cleanup_session_setup_error(
+                &mut rpc,
+                minor_version,
+                session.session_id,
+                err,
+            )
+            .await);
+        }
+        let max_operations = match session_max_operations(&session.fore_channel_attrs) {
+            Ok(max_operations) => max_operations,
+            Err(err) => {
+                return Err(cleanup_session_setup_error(
+                    &mut rpc,
+                    minor_version,
+                    session.session_id,
+                    err,
+                )
+                .await);
+            }
+        };
         let max_request_size = session.fore_channel_attrs.max_request_size;
         let max_response_size = session.fore_channel_attrs.max_response_size;
-        validate_session_compound_operation_count(1, max_operations)?;
-
-        let reclaim_res = raw_compound_with_rpc(
+        let mut sequence_id = 1;
+        let reclaim_res = match reclaim_complete_with_delayed_retry(
             &mut rpc,
-            "reclaim-complete",
             minor_version,
-            vec![
-                Operation::Sequence(SequenceArgs {
-                    session_id: session.session_id,
-                    sequence_id: 1,
-                    slot_id: 0,
-                    highest_slot_id: 0,
-                    cache_this: false,
-                }),
-                Operation::ReclaimComplete { one_fs: false },
-            ],
+            session.session_id,
+            &mut sequence_id,
+            max_operations,
+            builder.retry_policy,
         )
-        .await?;
-        ensure_reclaim_complete(&reclaim_res)?;
+        .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                return Err(cleanup_session_setup_error(
+                    &mut rpc,
+                    minor_version,
+                    session.session_id,
+                    err,
+                )
+                .await);
+            }
+        };
+        if let Err(err) = ensure_reclaim_complete(&reclaim_res) {
+            return Err(cleanup_session_setup_error(
+                &mut rpc,
+                minor_version,
+                session.session_id,
+                err,
+            )
+            .await);
+        }
 
         let client = Self {
             rpc,
             builder: stored_builder,
             client_id: exchange.client_id,
             session_id: session.session_id,
-            sequence_id: 2,
+            sequence_id,
             open_seqid: 1,
             open_owner: builder.open_owner.clone(),
             minor_version,
@@ -1454,6 +1501,12 @@ struct OpenedFile {
     stateid: StateId,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenFailureCleanup {
+    KeepPath,
+    RemovePath,
+}
+
 impl Client {
     async fn open(
         &mut self,
@@ -1461,56 +1514,154 @@ impl Client {
         share_access: u32,
         openhow: OpenHow,
     ) -> Result<OpenedFile> {
+        self.open_with_failure_cleanup(path, share_access, openhow, OpenFailureCleanup::KeepPath)
+            .await
+    }
+
+    async fn open_temp(
+        &mut self,
+        path: &str,
+        share_access: u32,
+        openhow: OpenHow,
+    ) -> Result<OpenedFile> {
+        self.open_with_failure_cleanup(path, share_access, openhow, OpenFailureCleanup::RemovePath)
+            .await
+    }
+
+    async fn open_with_failure_cleanup(
+        &mut self,
+        path: &str,
+        share_access: u32,
+        openhow: OpenHow,
+        cleanup: OpenFailureCleanup,
+    ) -> Result<OpenedFile> {
         let (parent_components, file_name) = split_parent(path)?;
-        let seqid = self.current_open_seqid();
-        let mut ops = vec![Operation::PutRootFh];
-        for component in parent_components {
-            ops.push(Operation::Lookup(component.to_owned()));
-        }
-        ops.push(Operation::Open(OpenArgs {
-            seqid,
-            share_access: share_access | OPEN4_SHARE_ACCESS_WANT_NO_DELEG,
-            share_deny: OPEN4_SHARE_DENY_NONE,
-            owner: OpenOwner {
-                client_id: self.client_id,
-                owner: self.open_owner.clone(),
-            },
-            openhow,
-            claim: OpenClaim::Null(file_name),
-        }));
-        ops.push(Operation::GetFh);
+        let mut retry = 0;
+        let mut recovered_session = false;
 
-        let response = self.compound_status(ops).await?;
-        if response_consumed_owner_seqid(&response, OpCode::Open) {
-            self.advance_open_seqid();
-        }
-        response.ensure_ok()?;
-        let open = response_open(&response)?;
-        let handle = response_getfh(&response)?;
-        let opened = OpenedFile {
-            handle,
-            stateid: open.stateid,
-        };
-
-        let delegation = match validate_open_result(&open, self.minor_version) {
-            Ok(delegation) => delegation,
-            Err(error) => {
-                let close_result = self.close(opened).await;
-                return Err(open_cleanup_error(error, close_result));
+        loop {
+            let seqid = self.current_open_seqid();
+            let mut ops = vec![Operation::PutRootFh];
+            for component in &parent_components {
+                ops.push(Operation::Lookup((*component).to_owned()));
             }
-        };
-        // The high-level client does not run a callback service, so avoid
-        // keeping delegations that the server granted despite WANT_NO_DELEG.
-        if let Some(delegation_stateid) = delegation
-            && let Err(error) = self
-                .return_open_delegation(&opened.handle, delegation_stateid)
-                .await
-        {
-            let close_result = self.close(opened).await;
-            return Err(open_cleanup_error(error, close_result));
-        }
+            ops.push(Operation::Open(OpenArgs {
+                seqid,
+                share_access: share_access | OPEN4_SHARE_ACCESS_WANT_NO_DELEG,
+                share_deny: OPEN4_SHARE_DENY_NONE,
+                owner: OpenOwner {
+                    client_id: self.client_id,
+                    owner: self.open_owner.clone(),
+                },
+                openhow: openhow.clone(),
+                claim: OpenClaim::Null(file_name.clone()),
+            }));
+            ops.push(Operation::GetFh);
 
-        Ok(opened)
+            let response = match self.compound_status(ops).await {
+                Ok(response) => response,
+                Err(err) if err.is_session_recoverable() && !recovered_session => {
+                    recovered_session = true;
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+            if response_consumed_owner_seqid(&response, OpCode::Open) {
+                self.advance_open_seqid();
+            }
+            if response_operation_has_delayed_status(&response, OpCode::Open)
+                && let Some(delay) = self.retry_policy.delay_for_retry(retry)
+            {
+                retry += 1;
+                ::tokio::time::sleep(delay).await;
+                continue;
+            }
+            if response_operation_requires_session_recovery(&response, OpCode::Open)
+                && !recovered_session
+            {
+                self.recover_session().await?;
+                recovered_session = true;
+                continue;
+            }
+            if let Err(error) = response.ensure_ok() {
+                return Err(self
+                    .cleanup_open_response(path, &response, error, cleanup)
+                    .await);
+            }
+            let open = response_open(&response)?;
+            let handle = match response_getfh(&response) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    let close_result = self.close_state_by_path(path, open.stateid).await;
+                    return Err(self
+                        .cleanup_failed_open(path, error, close_result, cleanup)
+                        .await);
+                }
+            };
+            let opened = OpenedFile {
+                handle,
+                stateid: open.stateid,
+            };
+
+            let delegation = match validate_open_result(&open, self.minor_version) {
+                Ok(delegation) => delegation,
+                Err(error) => {
+                    let close_result = self.close(opened).await;
+                    return Err(self
+                        .cleanup_failed_open(path, error, close_result, cleanup)
+                        .await);
+                }
+            };
+            // The high-level client does not run a callback service, so avoid
+            // keeping delegations that the server granted despite WANT_NO_DELEG.
+            if let Some(delegation_stateid) = delegation
+                && let Err(error) = self
+                    .return_open_delegation(&opened.handle, delegation_stateid)
+                    .await
+            {
+                let close_result = self.close(opened).await;
+                return Err(self
+                    .cleanup_failed_open(path, error, close_result, cleanup)
+                    .await);
+            }
+
+            return Ok(opened);
+        }
+    }
+
+    async fn cleanup_open_response(
+        &mut self,
+        path: &str,
+        response: &CompoundResponse,
+        error: Error,
+        cleanup: OpenFailureCleanup,
+    ) -> Error {
+        match response_open(response) {
+            Ok(open) => {
+                let close_result = self.close_state_by_path(path, open.stateid).await;
+                self.cleanup_failed_open(path, error, close_result, cleanup)
+                    .await
+            }
+            Err(_) => error,
+        }
+    }
+
+    async fn cleanup_failed_open(
+        &mut self,
+        path: &str,
+        error: Error,
+        close_result: Result<()>,
+        cleanup: OpenFailureCleanup,
+    ) -> Error {
+        let error = open_cleanup_error(error, close_result);
+        match cleanup {
+            OpenFailureCleanup::KeepPath => error,
+            OpenFailureCleanup::RemovePath => cleanup_error(
+                error,
+                "cleanup REMOVE after failed OPEN post-processing",
+                self.remove(path).await,
+            ),
+        }
     }
 
     async fn ensure_directory_type(
@@ -1788,21 +1939,56 @@ impl Client {
     }
 
     async fn close(&mut self, opened: OpenedFile) -> Result<()> {
-        let seqid = self.current_open_seqid();
-        let response = self
-            .compound_status(vec![
-                Operation::PutFh(opened.handle),
-                Operation::Close {
-                    seqid,
-                    stateid: opened.stateid,
-                },
-            ])
-            .await?;
-        if response_consumed_owner_seqid(&response, OpCode::Close) {
-            self.advance_open_seqid();
+        self.close_with_current_filehandle(vec![Operation::PutFh(opened.handle)], opened.stateid)
+            .await
+    }
+
+    async fn close_state_by_path(&mut self, path: &str, stateid: StateId) -> Result<()> {
+        let prefix = path_ops(path, Vec::new())?;
+        self.close_with_current_filehandle(prefix, stateid).await
+    }
+
+    async fn close_with_current_filehandle(
+        &mut self,
+        operations: Vec<Operation>,
+        stateid: StateId,
+    ) -> Result<()> {
+        let mut retry = 0;
+        let mut recovered_session = false;
+        loop {
+            let seqid = self.current_open_seqid();
+            let mut compound = operations.clone();
+            compound.push(Operation::Close { seqid, stateid });
+            let response = match self.compound_status(compound).await {
+                Ok(response) => response,
+                Err(err) if err.is_session_recoverable() && !recovered_session => {
+                    recovered_session = true;
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+            if response_consumed_owner_seqid(&response, OpCode::Close) {
+                self.advance_open_seqid();
+            }
+            if response_operation_has_delayed_status(&response, OpCode::Close)
+                && let Some(delay) = self.retry_policy.delay_for_retry(retry)
+            {
+                retry += 1;
+                ::tokio::time::sleep(delay).await;
+                continue;
+            }
+            if response_operation_requires_session_recovery(&response, OpCode::Close)
+                && !recovered_session
+            {
+                let error = response.ensure_ok().err().unwrap_or_else(|| {
+                    Error::Protocol("CLOSE required session recovery but response was OK".into())
+                });
+                self.recover_session().await?;
+                return Err(error);
+            }
+            response.ensure_ok()?;
+            return self.ensure_status(response, "CLOSE");
         }
-        response.ensure_ok()?;
-        self.ensure_status(response, "CLOSE")
     }
 
     fn ensure_status(&self, response: CompoundResponse, operation: &'static str) -> Result<()> {
@@ -1866,6 +2052,94 @@ async fn raw_compound_with_rpc(
     })?;
     validate_compound_response_shape(&tag, &expected, &response)?;
     Ok(response)
+}
+
+async fn raw_compound_with_delayed_retry(
+    rpc: &mut RpcClient,
+    tag: &'static str,
+    minor_version: u32,
+    operations: Vec<Operation>,
+    retry_policy: RetryPolicy,
+) -> Result<CompoundResponse> {
+    let mut retry = 0;
+    loop {
+        let response = raw_compound_with_rpc(rpc, tag, minor_version, operations.clone()).await?;
+        if response_allows_delayed_retry_without_sequence(&operations, &response)
+            && let Some(delay) = retry_policy.delay_for_retry(retry)
+        {
+            retry += 1;
+            ::tokio::time::sleep(delay).await;
+            continue;
+        }
+        return Ok(response);
+    }
+}
+
+async fn reclaim_complete_with_delayed_retry(
+    rpc: &mut RpcClient,
+    minor_version: u32,
+    session_id: SessionId,
+    sequence_id: &mut u32,
+    max_operations: usize,
+    retry_policy: RetryPolicy,
+) -> Result<CompoundResponse> {
+    let operations = vec![Operation::ReclaimComplete { one_fs: false }];
+    validate_session_compound_operation_count(operations.len(), max_operations)?;
+
+    let mut retry = 0;
+    loop {
+        let mut compound = Vec::with_capacity(operations.len() + 1);
+        compound.push(Operation::Sequence(SequenceArgs {
+            session_id,
+            sequence_id: *sequence_id,
+            slot_id: 0,
+            highest_slot_id: 0,
+            cache_this: false,
+        }));
+        compound.extend(operations.iter().cloned());
+
+        let response =
+            raw_compound_with_rpc(rpc, "reclaim-complete", minor_version, compound).await?;
+        if sequence_succeeded(&response) {
+            *sequence_id = (*sequence_id).wrapping_add(1).max(1);
+        }
+        if response_allows_delayed_retry(&operations, &response)
+            && let Some(delay) = retry_policy.delay_for_retry(retry)
+        {
+            retry += 1;
+            ::tokio::time::sleep(delay).await;
+            continue;
+        }
+        return Ok(response);
+    }
+}
+
+async fn cleanup_session_setup_error(
+    rpc: &mut RpcClient,
+    minor_version: u32,
+    session_id: SessionId,
+    error: Error,
+) -> Error {
+    cleanup_error(
+        error,
+        "cleanup DESTROY_SESSION after failed NFSv4 session setup",
+        destroy_session_with_rpc(rpc, minor_version, session_id).await,
+    )
+}
+
+async fn destroy_session_with_rpc(
+    rpc: &mut RpcClient,
+    minor_version: u32,
+    session_id: SessionId,
+) -> Result<()> {
+    let response = raw_compound_with_rpc(
+        rpc,
+        "destroy-session",
+        minor_version,
+        vec![Operation::DestroySession(session_id)],
+    )
+    .await?;
+    response.ensure_ok()
 }
 
 fn is_minor_version_mismatch(err: &Error) -> bool {
