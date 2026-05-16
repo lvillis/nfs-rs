@@ -14,8 +14,6 @@ pub enum Error {
     InvalidBool { value: u32 },
     /// Enum discriminant was unknown for the target type.
     InvalidDiscriminant { type_name: &'static str, value: i32 },
-    /// XDR opaque padding contained a non-zero byte.
-    InvalidPadding { value: u8 },
     /// Encoded length exceeded the caller-provided limit.
     LengthLimitExceeded { len: usize, max: usize },
     /// Encoded length cannot fit in an XDR `u32`.
@@ -41,9 +39,6 @@ impl fmt::Display for Error {
             }
             Self::InvalidDiscriminant { type_name, value } => {
                 write!(f, "invalid XDR discriminant {value} for {type_name}")
-            }
-            Self::InvalidPadding { value } => {
-                write!(f, "invalid non-zero XDR padding byte {value}")
             }
             Self::LengthLimitExceeded { len, max } => {
                 write!(f, "XDR length {len} exceeds limit {max}")

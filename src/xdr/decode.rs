@@ -166,11 +166,7 @@ impl<'de> Decoder<'de> {
     }
 
     fn skip_padding(&mut self, len: usize) -> Result<()> {
-        let padding = padding_len(len);
-        let padding = self.read_bytes(padding)?;
-        if let Some(value) = padding.iter().copied().find(|byte| *byte != 0) {
-            return Err(Error::InvalidPadding { value });
-        }
+        self.read_bytes(padding_len(len))?;
         Ok(())
     }
 }
