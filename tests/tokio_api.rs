@@ -32,6 +32,7 @@ async fn exposes_v4_tokio_api_shapes() {
         .write_size(64 * 1024)
         .dir_size(32 * 1024)
         .max_dir_entries(1024)
+        .max_minor_version(nfs::v4::NFS4_MINOR_VERSION_V42)
         .retry_policy(nfs::RetryPolicy::disabled());
 
     let _mask = nfs::v4::ACCESS4_READ | nfs::v4::ACCESS4_LOOKUP;

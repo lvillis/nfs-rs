@@ -8,6 +8,8 @@ fn rfc7530_8881_7862_program_constants_match_spec() {
     assert_eq!(NFS4_PROGRAM, 100003);
     assert_eq!(NFS4_VERSION, 4);
     assert_eq!(NFS4_PORT, 2049);
+    assert_eq!(NFS4_MINOR_VERSION_SESSION_MIN, 1);
+    assert_eq!(NFS4_MINOR_VERSION_V42, 2);
     assert_eq!(NFS4_MINOR_VERSION_LATEST, 2);
     assert_eq!(NFS4_FHSIZE, 128);
     assert_eq!(NFS4_VERIFIER_SIZE, 8);

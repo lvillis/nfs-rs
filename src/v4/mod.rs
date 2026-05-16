@@ -1,8 +1,10 @@
-//! NFSv4.2 client support.
+//! NFSv4 client support.
 //!
 //! NFSv4 is session-based and uses the server's v4 pseudo-filesystem rather
 //! than the NFSv3 MOUNT service. Paths passed to this module are absolute paths
 //! in that pseudo-filesystem, for example `/export/file.txt`.
+//! The high-level clients negotiate NFSv4.2 and fall back to NFSv4.1 when the
+//! server does not accept the newer minor version.
 //!
 //! Use [`blocking::Client`] with the default `blocking` feature, or
 //! [`tokio::Client`] with the `tokio` feature.
@@ -73,9 +75,10 @@ pub use proto::{
     NFS4_CONTENT_HOLE, NFS4_DEVICEID_SIZE, NFS4_FHSIZE, NFS4_INT32_MAX, NFS4_INT64_MAX,
     NFS4_MAX_CALLBACK_SEC_PARMS, NFS4_MAX_DEVICEIDS, NFS4_MAX_LAYOUT_ERRORS, NFS4_MAX_LAYOUTS,
     NFS4_MAX_NETLOCATIONS, NFS4_MAX_READ_PLUS_SEGMENTS, NFS4_MAX_SECINFO_FLAVORS, NFS4_MAXFILELEN,
-    NFS4_MAXFILEOFF, NFS4_MINOR_VERSION_LATEST, NFS4_OPAQUE_LIMIT, NFS4_PORT, NFS4_SESSIONID_SIZE,
-    NFS4_UINT32_MAX, NFS4_UINT64_MAX, NFS4_VERIFIER_SIZE, NetAddr, NetLoc, NfsAce, NfsSpaceLimit,
-    NfsTime, OPEN4_RESULT_CONFIRM, OPEN4_RESULT_LOCKTYPE_POSIX, OPEN4_RESULT_MAY_NOTIFY_LOCK,
+    NFS4_MAXFILEOFF, NFS4_MINOR_VERSION_LATEST, NFS4_MINOR_VERSION_SESSION_MIN,
+    NFS4_MINOR_VERSION_V42, NFS4_OPAQUE_LIMIT, NFS4_PORT, NFS4_SESSIONID_SIZE, NFS4_UINT32_MAX,
+    NFS4_UINT64_MAX, NFS4_VERIFIER_SIZE, NetAddr, NetLoc, NfsAce, NfsSpaceLimit, NfsTime,
+    OPEN4_RESULT_CONFIRM, OPEN4_RESULT_LOCKTYPE_POSIX, OPEN4_RESULT_MAY_NOTIFY_LOCK,
     OPEN4_RESULT_PRESERVE_UNLINKED, OPEN4_SHARE_ACCESS_BOTH, OPEN4_SHARE_ACCESS_READ,
     OPEN4_SHARE_ACCESS_WANT_ANY_DELEG, OPEN4_SHARE_ACCESS_WANT_CANCEL,
     OPEN4_SHARE_ACCESS_WANT_DELEG_MASK, OPEN4_SHARE_ACCESS_WANT_NO_DELEG,
@@ -133,6 +136,37 @@ pub(crate) fn validate_max_dir_entries(max_dir_entries: usize) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+pub(crate) fn validate_minor_version(name: &'static str, minor_version: u32) -> Result<()> {
+    if !(proto::NFS4_MINOR_VERSION_SESSION_MIN..=proto::NFS4_MINOR_VERSION_LATEST)
+        .contains(&minor_version)
+    {
+        return Err(Error::Protocol(format!(
+            "{name} must be in {}..={}",
+            proto::NFS4_MINOR_VERSION_SESSION_MIN,
+            proto::NFS4_MINOR_VERSION_LATEST
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn negotiated_minor_versions(max_minor_version: u32) -> impl Iterator<Item = u32> {
+    (proto::NFS4_MINOR_VERSION_SESSION_MIN..=max_minor_version).rev()
+}
+
+pub(crate) fn require_minor_version(
+    operation: &'static str,
+    negotiated: u32,
+    required: u32,
+) -> Result<()> {
+    if negotiated >= required {
+        Ok(())
+    } else {
+        Err(Error::Protocol(format!(
+            "NFSv4 operation {operation} requires minor version {required}, negotiated {negotiated}"
+        )))
+    }
 }
 
 pub(crate) fn clamp_io_size(server_max: Option<u64>, configured_limit: u32) -> u32 {
@@ -218,6 +252,35 @@ mod tests {
             Err(Error::Protocol(_))
         ));
         assert!(validate_transfer_size("read_size", proto::NFS4_MAX_IO as u32).is_ok());
+    }
+
+    #[test]
+    fn validates_supported_session_minor_versions() {
+        assert!(matches!(
+            validate_minor_version("max_minor_version", 0),
+            Err(Error::Protocol(_))
+        ));
+        assert!(validate_minor_version("max_minor_version", 1).is_ok());
+        assert!(validate_minor_version("max_minor_version", 2).is_ok());
+        assert!(matches!(
+            validate_minor_version("max_minor_version", 3),
+            Err(Error::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn negotiates_minor_versions_from_high_to_low() {
+        assert_eq!(negotiated_minor_versions(2).collect::<Vec<_>>(), vec![2, 1]);
+        assert_eq!(negotiated_minor_versions(1).collect::<Vec<_>>(), vec![1]);
+    }
+
+    #[test]
+    fn rejects_operations_above_negotiated_minor_version() {
+        assert!(require_minor_version("SEEK", 2, 2).is_ok());
+        assert!(matches!(
+            require_minor_version("SEEK", 1, 2),
+            Err(Error::Protocol(_))
+        ));
     }
 
     #[test]

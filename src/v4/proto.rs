@@ -7,6 +7,8 @@ use crate::xdr::{Decode, Decoder, Encode, Encoder};
 pub const NFS4_PROGRAM: u32 = 100003;
 pub const NFS4_VERSION: u32 = 4;
 pub const NFS4_PORT: u16 = 2049;
+pub const NFS4_MINOR_VERSION_SESSION_MIN: u32 = 1;
+pub const NFS4_MINOR_VERSION_V42: u32 = 2;
 pub const NFS4_MINOR_VERSION_LATEST: u32 = 2;
 
 pub const NFS4_FHSIZE: usize = 128;
@@ -2761,7 +2763,7 @@ pub struct OpenResult {
 }
 
 /// NFSv4 write stability requested or reported by the server.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StableHow {
     /// Server may cache data without committing it to stable storage.
     Unstable,
@@ -2789,6 +2791,11 @@ impl StableHow {
             2 => Self::FileSync,
             _ => return None,
         })
+    }
+
+    #[cfg(any(test, feature = "blocking", feature = "tokio"))]
+    pub(crate) fn satisfies(self, requested: Self) -> bool {
+        self >= requested
     }
 }
 
@@ -5184,5 +5191,16 @@ mod tests {
         assert_eq!(attrs.max_response_size_cached, DEFAULT_SESSION_CHANNEL_SIZE);
         assert!(attrs.max_operations > 0);
         assert!(attrs.max_requests > 0);
+    }
+
+    #[test]
+    fn stable_how_reports_whether_server_commitment_satisfies_request() {
+        assert!(StableHow::FileSync.satisfies(StableHow::Unstable));
+        assert!(StableHow::FileSync.satisfies(StableHow::DataSync));
+        assert!(StableHow::FileSync.satisfies(StableHow::FileSync));
+        assert!(StableHow::DataSync.satisfies(StableHow::Unstable));
+        assert!(StableHow::DataSync.satisfies(StableHow::DataSync));
+        assert!(!StableHow::DataSync.satisfies(StableHow::FileSync));
+        assert!(!StableHow::Unstable.satisfies(StableHow::DataSync));
     }
 }

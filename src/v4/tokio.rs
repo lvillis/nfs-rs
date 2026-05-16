@@ -1,6 +1,6 @@
-//! Tokio NFSv4.2 client.
+//! Tokio NFSv4 client.
 //!
-//! This module mirrors the blocking NFSv4.2 client with `async fn` methods and
+//! This module mirrors the blocking NFSv4 client with `async fn` methods and
 //! Tokio I/O traits. Paths are absolute paths in the server's v4
 //! pseudo-filesystem.
 //!
@@ -33,8 +33,9 @@ use crate::v4::client::{
 };
 use crate::v4::proto::*;
 use crate::v4::{
-    clamp_io_size, default_open_owner, default_owner_id, validate_max_dir_entries,
-    validate_open_owner, validate_owner_id, validate_transfer_size,
+    clamp_io_size, default_open_owner, default_owner_id, negotiated_minor_versions,
+    require_minor_version, validate_max_dir_entries, validate_minor_version, validate_open_owner,
+    validate_owner_id, validate_transfer_size,
 };
 use crate::xdr::{Decode, Decoder};
 
@@ -43,7 +44,7 @@ const DEFAULT_DIR_SIZE: u32 = 128 * 1024;
 
 pub use crate::v4::client::{DirEntry, DirPage, DirPageCursor};
 
-/// Builder for a Tokio NFSv4.2 [`Client`].
+/// Builder for a Tokio NFSv4 [`Client`].
 ///
 /// It has the same configuration model as
 /// [`crate::v4::blocking::ClientBuilder`], but connects asynchronously.
@@ -60,6 +61,7 @@ pub struct ClientBuilder {
     write_size: u32,
     dir_size: u32,
     max_dir_entries: usize,
+    max_minor_version: u32,
     retry_policy: RetryPolicy,
 }
 
@@ -79,6 +81,7 @@ impl ClientBuilder {
             write_size: DEFAULT_IO_SIZE,
             dir_size: DEFAULT_DIR_SIZE,
             max_dir_entries: NFS4_MAX_DIR_ENTRIES,
+            max_minor_version: NFS4_MINOR_VERSION_LATEST,
             retry_policy: RetryPolicy::default(),
         }
     }
@@ -150,6 +153,16 @@ impl ClientBuilder {
         self
     }
 
+    /// Sets the highest NFSv4 minor version the client may negotiate.
+    ///
+    /// The session client supports NFSv4.1 and NFSv4.2. By default it tries
+    /// NFSv4.2 first and falls back to NFSv4.1 when the server rejects the
+    /// newer minor version.
+    pub fn max_minor_version(mut self, minor_version: u32) -> Self {
+        self.max_minor_version = minor_version;
+        self
+    }
+
     /// Sets retry behavior for retryable transport and protocol responses.
     pub fn retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
         self.retry_policy = retry_policy;
@@ -162,7 +175,7 @@ impl ClientBuilder {
     }
 }
 
-/// Tokio, path-oriented NFSv4.2 client.
+/// Tokio, path-oriented NFSv4 client.
 ///
 /// This client owns an asynchronous NFSv4 session and mirrors the high-level
 /// operations provided by [`crate::v4::blocking::Client`].
@@ -175,6 +188,7 @@ pub struct Client {
     sequence_id: u32,
     open_seqid: u32,
     open_owner: Vec<u8>,
+    minor_version: u32,
     root_fsinfo: Option<FsInfo>,
     read_size: u32,
     write_size: u32,
@@ -192,6 +206,11 @@ impl Client {
     /// Creates a builder for the given server host.
     pub fn builder(host: impl Into<String>) -> ClientBuilder {
         ClientBuilder::new(host)
+    }
+
+    /// Returns the negotiated NFSv4 minor version.
+    pub fn minor_version(&self) -> u32 {
+        self.minor_version
     }
 
     /// Resolves a path and returns success if it exists.
@@ -372,6 +391,7 @@ impl Client {
     }
 
     pub async fn seek(&mut self, path: &str, offset: u64, what: SeekContent) -> Result<SeekResult> {
+        require_minor_version("SEEK", self.minor_version, NFS4_MINOR_VERSION_V42)?;
         let opened = self
             .open(path, OPEN4_SHARE_ACCESS_READ, OpenHow::NoCreate)
             .await?;
@@ -1183,7 +1203,7 @@ impl Client {
         let response = self
             .raw_compound(
                 "destroy-session",
-                NFS4_MINOR_VERSION_LATEST,
+                self.minor_version,
                 vec![Operation::DestroySession(session_id)],
             )
             .await?;
@@ -1205,7 +1225,7 @@ impl Client {
             with_sequence.extend(operations.iter().cloned());
 
             let response = self
-                .raw_compound("nfs-rs-v4", NFS4_MINOR_VERSION_LATEST, with_sequence)
+                .raw_compound("nfs-rs-v4", self.minor_version, with_sequence)
                 .await?;
             if sequence_succeeded(&response) {
                 self.sequence_id = self.sequence_id.wrapping_add(1).max(1);
@@ -1240,7 +1260,25 @@ impl Client {
         validate_transfer_size("write_size", builder.write_size)?;
         validate_transfer_size("dir_size", builder.dir_size)?;
         validate_max_dir_entries(builder.max_dir_entries)?;
+        validate_minor_version("max_minor_version", builder.max_minor_version)?;
 
+        let mut last_minor_error = None;
+        for minor_version in negotiated_minor_versions(builder.max_minor_version) {
+            match Self::connect_session_minor(builder.clone(), minor_version).await {
+                Ok(client) => return Ok(client),
+                Err(err) if is_minor_version_mismatch(&err) => {
+                    last_minor_error = Some(err);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        Err(last_minor_error.unwrap_or_else(|| {
+            Error::Protocol("NFSv4 server did not accept a supported minor version".to_owned())
+        }))
+    }
+
+    async fn connect_session_minor(builder: ClientBuilder, minor_version: u32) -> Result<Self> {
         let stored_builder = builder.clone();
         let mut rpc = RpcClient::connect_with_timeout(
             (builder.host.as_str(), builder.port),
@@ -1265,7 +1303,7 @@ impl Client {
         let exchange_res = raw_compound_with_rpc(
             &mut rpc,
             "exchange-id",
-            NFS4_MINOR_VERSION_LATEST,
+            minor_version,
             vec![Operation::ExchangeId(exchange)],
         )
         .await?;
@@ -1284,7 +1322,7 @@ impl Client {
         let session_res = raw_compound_with_rpc(
             &mut rpc,
             "create-session",
-            NFS4_MINOR_VERSION_LATEST,
+            minor_version,
             vec![Operation::CreateSession(create_session)],
         )
         .await?;
@@ -1294,7 +1332,7 @@ impl Client {
         let reclaim_res = raw_compound_with_rpc(
             &mut rpc,
             "reclaim-complete",
-            NFS4_MINOR_VERSION_LATEST,
+            minor_version,
             vec![
                 Operation::Sequence(SequenceArgs {
                     session_id: session.session_id,
@@ -1317,6 +1355,7 @@ impl Client {
             sequence_id: 2,
             open_seqid: 1,
             open_owner: builder.open_owner.clone(),
+            minor_version,
             root_fsinfo: None,
             read_size: builder.read_size,
             write_size: builder.write_size,
@@ -1526,6 +1565,7 @@ impl Client {
         if length == 0 {
             return Ok(());
         }
+        require_minor_version(op.name(), self.minor_version, NFS4_MINOR_VERSION_V42)?;
 
         let opened = self
             .open(path, OPEN4_SHARE_ACCESS_WRITE, OpenHow::NoCreate)
@@ -1572,7 +1612,8 @@ impl Client {
                     },
                 ])
                 .await?;
-            let written = response_write(&response)?.count;
+            let result = response_write(&response)?;
+            let written = result.count;
             if written == 0 {
                 return Err(Error::Protocol("NFSv4 WRITE accepted zero bytes".into()));
             }
@@ -1582,10 +1623,33 @@ impl Client {
                     "NFSv4 WRITE reported {written} bytes for a {chunk_len} byte request"
                 )));
             }
+            if !result.committed.satisfies(StableHow::FileSync) {
+                let commit = self.commit_opened(opened, offset, result.count).await?;
+                if commit.verifier != result.verifier {
+                    return Err(Error::Protocol(
+                        "NFSv4 COMMIT verifier changed after unstable WRITE".into(),
+                    ));
+                }
+            }
             advance_offset(&mut offset, written, "NFSv4 WRITE")?;
             data = &data[written..];
         }
         Ok(())
+    }
+
+    async fn commit_opened(
+        &mut self,
+        opened: &OpenedFile,
+        offset: u64,
+        count: u32,
+    ) -> Result<CommitResult> {
+        let response = self
+            .compound(vec![
+                Operation::PutFh(opened.handle.clone()),
+                Operation::Commit { offset, count },
+            ])
+            .await?;
+        response_commit(&response)
     }
 
     async fn write_opened_from_reader<R: AsyncRead + Unpin + ?Sized>(
@@ -1711,4 +1775,14 @@ async fn raw_compound_with_rpc(
         ))
     })?;
     Ok(response)
+}
+
+fn is_minor_version_mismatch(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::NfsV4 {
+            status: Status::MinorVersionMismatch,
+            ..
+        }
+    )
 }
