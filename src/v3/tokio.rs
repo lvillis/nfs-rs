@@ -25,8 +25,8 @@ use crate::rpc::{Auth, AuthSys, max_record_size_for_payloads};
 use crate::tokio_rpc::RpcClient;
 use crate::v3::client::{
     advance_offset, append_dir_entries, clamp_dir_size, clamp_io_size, dir_page_from_batch,
-    join_path, normalize_path, temporary_sibling_path, validate_max_dir_entries,
-    validate_transfer_size,
+    join_path, normalize_path, temporary_sibling_path, validate_max_dir_entries, validate_port,
+    validate_remote_target, validate_transfer_size,
 };
 use crate::v3::mount::{MNTPATHLEN, MOUNT_PROGRAM, MOUNT_VERSION, MountInfo, MountStatus};
 use crate::v3::portmap::{IPPROTO_TCP, PMAP_PORT, PMAP_PROGRAM, PMAP_VERSION};
@@ -1760,12 +1760,7 @@ impl Client {
     }
 
     async fn connect_with_builder(builder: ClientBuilder) -> Result<Self> {
-        if !builder.target.export.starts_with('/') {
-            return Err(Error::InvalidTarget(format!(
-                "{}:{}",
-                builder.target.host, builder.target.export
-            )));
-        }
+        validate_remote_target(&builder.target)?;
         let read_size_limit = validate_transfer_size("read_size", builder.read_size_limit)?;
         let write_size_limit = validate_transfer_size("write_size", builder.write_size_limit)?;
         let dir_size_limit = validate_transfer_size("dir_size", builder.dir_size_limit)?;
@@ -1773,7 +1768,10 @@ impl Client {
 
         let stored_builder = builder.clone();
         let mount_port = match builder.mount_port {
-            Some(port) => port,
+            Some(port) => {
+                validate_port("mount_port", port)?;
+                port
+            }
             None => {
                 get_tcp_port_with_timeout(
                     &builder.target.host,
@@ -1795,7 +1793,10 @@ impl Client {
         let mount_info = mount.mount(&builder.target.export).await?;
 
         let nfs_port = match builder.nfs_port {
-            Some(port) => port,
+            Some(port) => {
+                validate_port("nfs_port", port)?;
+                port
+            }
             None => get_tcp_port_with_timeout(
                 &builder.target.host,
                 NFS_PROGRAM,

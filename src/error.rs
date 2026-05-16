@@ -150,8 +150,9 @@ impl Error {
 
     /// Returns true when retrying the operation may succeed.
     ///
-    /// This covers transient I/O failures, NFSv3 `Jukebox`, NFSv4 `Delay` or
-    /// `Grace`, and NFSv4 statuses that require session recovery.
+    /// This covers transient I/O failures, NFSv3 `Jukebox`, and NFSv4
+    /// `Delay` or `Grace`. Session recovery statuses are handled internally by
+    /// NFSv4 clients only when the operation is safe to replay.
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Io(err) => is_retryable_io_error(err.kind()),
@@ -162,6 +163,19 @@ impl Error {
             Self::NfsV4 { status, .. } => status.is_retryable(),
             _ => false,
         }
+    }
+
+    /// Returns true when an NFSv4 status indicates that the session is no
+    /// longer usable.
+    ///
+    /// This is primarily useful for low-level protocol integrations. The
+    /// high-level NFSv4 clients recreate sessions internally and only replay
+    /// operations that are safe to send again.
+    pub fn requires_session_recovery(&self) -> bool {
+        matches!(
+            self,
+            Self::NfsV4 { status, .. } if status.requires_session_recovery()
+        )
     }
 
     /// Returns true for quota or no-space conditions.

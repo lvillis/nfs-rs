@@ -10,6 +10,8 @@ use crate::xdr::{Decoder, Encode, Encoder};
 pub const RPC_VERSION: u32 = 2;
 pub const AUTH_NONE: u32 = 0;
 pub const AUTH_SYS: u32 = 1;
+/// Maximum UTF-8 byte length of an AUTH_SYS machine name.
+pub const AUTH_SYS_MACHINE_NAME_MAX: usize = 255;
 /// Maximum number of auxiliary groups carried by AUTH_SYS credentials.
 pub const AUTH_SYS_MAX_GROUPS: usize = 16;
 
@@ -80,15 +82,17 @@ pub struct AuthSys {
 impl AuthSys {
     /// Builds an AUTH_SYS credential from explicit identity fields.
     ///
-    /// At encode time the supplementary group list is limited by
-    /// [`AUTH_SYS_MAX_GROUPS`].
+    /// Credential fields are normalized to AUTH_SYS wire limits. The machine
+    /// name is truncated at a UTF-8 boundary to [`AUTH_SYS_MACHINE_NAME_MAX`]
+    /// bytes. Supplementary groups have the primary gid removed, duplicates
+    /// removed, and at most [`AUTH_SYS_MAX_GROUPS`] groups retained.
     pub fn new(machine_name: impl Into<String>, uid: u32, gid: u32, gids: Vec<u32>) -> Self {
         Self {
             stamp: default_stamp(),
-            machine_name: machine_name.into(),
+            machine_name: normalize_machine_name(machine_name.into()),
             uid,
             gid,
-            gids,
+            gids: normalize_auxiliary_gids(gid, gids),
         }
     }
 
@@ -117,11 +121,15 @@ impl Default for AuthSys {
 
 impl Encode for AuthSys {
     fn encode(&self, encoder: &mut Encoder) -> crate::xdr::Result<()> {
+        let gids = normalize_auxiliary_gids(self.gid, self.gids.iter().copied());
         encoder.write_u32(self.stamp);
-        encoder.write_string(&self.machine_name, 255)?;
+        encoder.write_string(
+            normalized_machine_name_ref(&self.machine_name),
+            AUTH_SYS_MACHINE_NAME_MAX,
+        )?;
         encoder.write_u32(self.uid);
         encoder.write_u32(self.gid);
-        encoder.write_array(&self.gids, AUTH_SYS_MAX_GROUPS)?;
+        encoder.write_array(&gids, AUTH_SYS_MAX_GROUPS)?;
         Ok(())
     }
 }
@@ -423,6 +431,28 @@ fn normalize_auxiliary_gids(primary_gid: u32, groups: impl IntoIterator<Item = u
     normalized
 }
 
+fn normalize_machine_name(mut machine_name: String) -> String {
+    let len = normalized_machine_name_len(&machine_name);
+    machine_name.truncate(len);
+    machine_name
+}
+
+fn normalized_machine_name_ref(machine_name: &str) -> &str {
+    &machine_name[..normalized_machine_name_len(machine_name)]
+}
+
+fn normalized_machine_name_len(machine_name: &str) -> usize {
+    if machine_name.len() <= AUTH_SYS_MACHINE_NAME_MAX {
+        return machine_name.len();
+    }
+
+    let mut len = AUTH_SYS_MACHINE_NAME_MAX;
+    while !machine_name.is_char_boundary(len) {
+        len -= 1;
+    }
+    len
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,5 +511,96 @@ mod tests {
         let auth = AuthSys::current();
         assert!(auth.gids.len() <= AUTH_SYS_MAX_GROUPS);
         assert!(!auth.gids.contains(&auth.gid));
+    }
+
+    #[test]
+    fn auth_sys_new_normalizes_machine_name() {
+        let auth = AuthSys::new(
+            "a".repeat(AUTH_SYS_MACHINE_NAME_MAX + 1),
+            20,
+            10,
+            Vec::new(),
+        );
+
+        assert_eq!(auth.machine_name.len(), AUTH_SYS_MACHINE_NAME_MAX);
+        assert!(auth.machine_name.bytes().all(|byte| byte == b'a'));
+    }
+
+    #[test]
+    fn auth_sys_new_truncates_machine_name_at_utf8_boundary() {
+        let mut machine_name = "a".repeat(AUTH_SYS_MACHINE_NAME_MAX - 1);
+        machine_name.push('é');
+        let auth = AuthSys::new(machine_name, 20, 10, Vec::new());
+
+        assert_eq!(auth.machine_name.len(), AUTH_SYS_MACHINE_NAME_MAX - 1);
+        assert!(auth.machine_name.ends_with('a'));
+    }
+
+    #[test]
+    fn auth_sys_new_normalizes_auxiliary_groups() {
+        let auth = AuthSys::new(
+            "host",
+            20,
+            10,
+            vec![10, 1, 2, 1, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 17],
+        );
+
+        assert_eq!(
+            auth.gids,
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 17]
+        );
+        assert_eq!(auth.gids.len(), AUTH_SYS_MAX_GROUPS);
+        assert!(!auth.gids.contains(&auth.gid));
+    }
+
+    #[test]
+    fn auth_sys_encode_normalizes_public_group_field() {
+        let auth = AuthSys {
+            stamp: 1,
+            machine_name: "host".to_owned(),
+            uid: 20,
+            gid: 10,
+            gids: vec![10, 1, 2, 1, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 17],
+        };
+
+        let bytes = crate::xdr::to_bytes(&auth).unwrap();
+        let mut decoder = Decoder::new(&bytes);
+        assert_eq!(decoder.read_u32().unwrap(), 1);
+        assert_eq!(decoder.read_string(255).unwrap(), "host");
+        assert_eq!(decoder.read_u32().unwrap(), 20);
+        assert_eq!(decoder.read_u32().unwrap(), 10);
+        assert_eq!(
+            decoder.read_array::<u32>(AUTH_SYS_MAX_GROUPS).unwrap(),
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 17]
+        );
+        decoder.finish().unwrap();
+    }
+
+    #[test]
+    fn auth_sys_encode_normalizes_public_machine_name_field() {
+        let auth = AuthSys {
+            stamp: 1,
+            machine_name: "a".repeat(AUTH_SYS_MACHINE_NAME_MAX + 1),
+            uid: 20,
+            gid: 10,
+            gids: Vec::new(),
+        };
+
+        let bytes = crate::xdr::to_bytes(&auth).unwrap();
+        let mut decoder = Decoder::new(&bytes);
+        assert_eq!(decoder.read_u32().unwrap(), 1);
+        assert_eq!(
+            decoder.read_string(AUTH_SYS_MACHINE_NAME_MAX).unwrap(),
+            "a".repeat(AUTH_SYS_MACHINE_NAME_MAX)
+        );
+        assert_eq!(decoder.read_u32().unwrap(), 20);
+        assert_eq!(decoder.read_u32().unwrap(), 10);
+        assert!(
+            decoder
+                .read_array::<u32>(AUTH_SYS_MAX_GROUPS)
+                .unwrap()
+                .is_empty()
+        );
+        decoder.finish().unwrap();
     }
 }

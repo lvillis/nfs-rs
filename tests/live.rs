@@ -251,6 +251,9 @@ fn exercise_v4_blocking(client: &mut nfs::v4::blocking::Client, root: &str) -> R
     if let Some(mode) = client.metadata(&file)?.mode {
         assert_eq!(mode & 0o777, 0o600);
     }
+    client.setattr(&file, &nfs::v4::SetAttrs::size(4))?;
+    assert_eq!(client.read(&file)?, b"nfs-");
+    client.write(&file, b"nfs-rs-live")?;
     assert_eq!(client.read_at(&file, 4, 2)?, b"rs");
     assert_eq!(client.read_exact_at(&file, 4, 2)?, b"rs");
     assert_eq!(client.read_range(&file, 4, 7)?, b"rs-live");
@@ -470,6 +473,9 @@ async fn exercise_v4_tokio(client: &mut nfs::v4::tokio::Client, root: &str) -> R
     if let Some(mode) = client.metadata(&file).await?.mode {
         assert_eq!(mode & 0o777, 0o600);
     }
+    client.setattr(&file, &nfs::v4::SetAttrs::size(4)).await?;
+    assert_eq!(client.read(&file).await?, b"nfs-");
+    client.write(&file, b"nfs-rs-live").await?;
     assert_eq!(client.read_at(&file, 4, 2).await?, b"rs");
     assert_eq!(client.read_exact_at(&file, 4, 2).await?, b"rs");
     assert_eq!(client.read_range(&file, 4, 7).await?, b"rs-live");

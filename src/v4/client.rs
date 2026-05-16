@@ -14,11 +14,15 @@ pub(crate) fn sequence_succeeded(response: &CompoundResponse) -> bool {
 }
 
 pub(crate) fn response_has_retryable_status(response: &CompoundResponse) -> bool {
-    response.status.is_retryable()
+    status_allows_delayed_retry(response.status)
         || response
             .results
             .iter()
-            .any(|result| result.status().is_retryable())
+            .any(|result| status_allows_delayed_retry(result.status()))
+}
+
+fn status_allows_delayed_retry(status: Status) -> bool {
+    matches!(status, Status::Delay | Status::Grace)
 }
 
 pub(crate) fn response_requires_session_recovery(response: &CompoundResponse) -> bool {
@@ -26,6 +30,122 @@ pub(crate) fn response_requires_session_recovery(response: &CompoundResponse) ->
         response.results.first(),
         Some(OperationResult::Sequence { status, .. }) if status.requires_session_recovery()
     ) || (response.results.is_empty() && response.status.requires_session_recovery())
+}
+
+pub(crate) fn session_recovery_error(response: &CompoundResponse) -> Error {
+    match response.results.first() {
+        Some(OperationResult::Sequence { status, .. }) if status.requires_session_recovery() => {
+            Error::nfsv4("SEQUENCE", *status)
+        }
+        Some(result) => Error::nfsv4(result.op_name(), result.status()),
+        None => Error::nfsv4("COMPOUND", response.status),
+    }
+}
+
+pub(crate) fn response_consumed_owner_seqid(response: &CompoundResponse, op: OpCode) -> bool {
+    response
+        .results
+        .iter()
+        .any(|result| result.op_code() == op && owner_seqid_status_consumes(result.status()))
+}
+
+fn owner_seqid_status_consumes(status: Status) -> bool {
+    !matches!(
+        status,
+        Status::BadSeqId | Status::Delay | Status::Grace | Status::StaleClientId
+    )
+}
+
+const NFS4_COMPOUND_IO_HEADROOM: u32 = 4096;
+
+pub(crate) fn session_payload_limit(channel_size: u32) -> u32 {
+    channel_size
+        .saturating_sub(NFS4_COMPOUND_IO_HEADROOM)
+        .clamp(1, NFS4_MAX_IO as u32)
+}
+
+pub(crate) fn operations_can_replay_after_session_recovery(operations: &[Operation]) -> bool {
+    operations
+        .iter()
+        .all(operation_can_replay_after_session_recovery)
+}
+
+fn operation_can_replay_after_session_recovery(operation: &Operation) -> bool {
+    match operation {
+        // Recreating a session loses the previous session's reply cache.
+        // Replay only read-only operations that do not consume client state;
+        // mutating namespace/data/state operations must be retried at a higher
+        // layer where fresh state and application idempotency are available.
+        Operation::PutRootFh
+        | Operation::PutPubFh
+        | Operation::PutFh(_)
+        | Operation::Lookup(_)
+        | Operation::Lookupp
+        | Operation::Access(_)
+        | Operation::SecInfo(_)
+        | Operation::SecInfoNoName(_)
+        | Operation::NVerify(_)
+        | Operation::GetFh
+        | Operation::GetAttr(_)
+        | Operation::ReadDir { .. }
+        | Operation::ReadLink
+        | Operation::Verify(_)
+        | Operation::SaveFh
+        | Operation::RestoreFh => true,
+        Operation::Read { stateid, .. } => stateid.is_anonymous(),
+        Operation::Write { .. }
+        | Operation::Commit { .. }
+        | Operation::SetAttr { .. }
+        | Operation::Remove(_)
+        | Operation::Link(_)
+        | Operation::Rename { .. }
+        | Operation::Create(_)
+        | Operation::SetClientId(_)
+        | Operation::SetClientIdConfirm(_)
+        | Operation::ExchangeId(_)
+        | Operation::CreateSession(_)
+        | Operation::BackchannelCtl(_)
+        | Operation::BindConnToSession(_)
+        | Operation::DestroySession(_)
+        | Operation::DestroyClientId(_)
+        | Operation::ReclaimComplete { .. }
+        | Operation::Sequence(_)
+        | Operation::DelegPurge(_)
+        | Operation::DelegReturn(_)
+        | Operation::Open(_)
+        | Operation::OpenAttr { .. }
+        | Operation::OpenConfirm { .. }
+        | Operation::Close { .. }
+        | Operation::Lock(_)
+        | Operation::LockTest(_)
+        | Operation::LockUnlock(_)
+        | Operation::OpenDowngrade { .. }
+        | Operation::FreeStateId(_)
+        | Operation::TestStateIds(_)
+        | Operation::GetDirDelegation(_)
+        | Operation::GetDeviceInfo(_)
+        | Operation::GetDeviceList(_)
+        | Operation::LayoutCommit(_)
+        | Operation::LayoutGet(_)
+        | Operation::LayoutReturn(_)
+        | Operation::SetSsv(_)
+        | Operation::WantDelegation(_)
+        | Operation::Allocate { .. }
+        | Operation::Deallocate { .. }
+        | Operation::IoAdvise(_)
+        | Operation::Copy(_)
+        | Operation::CopyNotify(_)
+        | Operation::LayoutError(_)
+        | Operation::LayoutStats(_)
+        | Operation::OffloadCancel(_)
+        | Operation::OffloadStatus(_)
+        | Operation::ReadPlus(_)
+        | Operation::Seek { .. }
+        | Operation::Clone(_)
+        | Operation::WriteSame(_)
+        | Operation::Renew(_)
+        | Operation::ReleaseLockOwner(_) => false,
+    }
 }
 
 pub(crate) fn ensure_reclaim_complete(response: &CompoundResponse) -> Result<()> {
@@ -39,6 +159,31 @@ pub(crate) fn ensure_reclaim_complete(response: &CompoundResponse) -> Result<()>
     } else {
         response.ensure_ok()
     }
+}
+
+pub(crate) fn session_max_operations(attrs: &ChannelAttrs) -> Result<usize> {
+    let max_operations = attrs.max_operations as usize;
+    if max_operations == 0 {
+        return Err(Error::Protocol(
+            "NFSv4 session fore channel returned max_operations=0".to_owned(),
+        ));
+    }
+    Ok(max_operations.min(NFS4_MAX_OPS))
+}
+
+pub(crate) fn validate_session_compound_operation_count(
+    operation_count: usize,
+    max_operations: usize,
+) -> Result<()> {
+    let total = operation_count
+        .checked_add(1)
+        .ok_or_else(|| Error::Protocol("NFSv4 COMPOUND operation count overflow".to_owned()))?;
+    if total > max_operations {
+        return Err(Error::Protocol(format!(
+            "NFSv4 COMPOUND has {total} operations including SEQUENCE, but session allows {max_operations}"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,6 +291,10 @@ pub(crate) fn finish_with_close<T>(result: Result<T>, close_result: Result<()>) 
         }
         Err(err) => Err(err),
     }
+}
+
+pub(crate) fn attrs_require_open_state(attrs: &Fattr) -> bool {
+    attrs.attrmask.contains(FATTR4_SIZE)
 }
 
 pub(crate) fn advance_offset(
@@ -523,6 +672,66 @@ mod tests {
     }
 
     #[test]
+    fn detects_attrs_that_require_open_state() {
+        assert!(attrs_require_open_state(&Fattr::size(10)));
+        assert!(!attrs_require_open_state(&Fattr::mode(0o644)));
+        assert!(!attrs_require_open_state(&Fattr::empty()));
+    }
+
+    #[test]
+    fn owner_seqid_advances_only_when_owner_operation_was_seen() {
+        let before_open = CompoundResponse {
+            status: Status::NoEnt,
+            tag: String::new(),
+            results: vec![
+                OperationResult::Sequence {
+                    status: Status::Ok,
+                    result: None,
+                },
+                OperationResult::StatusOnly {
+                    op: OpCode::Lookup,
+                    status: Status::NoEnt,
+                },
+            ],
+        };
+        assert!(!response_consumed_owner_seqid(&before_open, OpCode::Open));
+
+        let failed_open = CompoundResponse {
+            status: Status::NoEnt,
+            tag: String::new(),
+            results: vec![
+                OperationResult::Sequence {
+                    status: Status::Ok,
+                    result: None,
+                },
+                OperationResult::Open {
+                    status: Status::NoEnt,
+                    result: None,
+                },
+            ],
+        };
+        assert!(response_consumed_owner_seqid(&failed_open, OpCode::Open));
+
+        let bad_seqid = CompoundResponse {
+            status: Status::BadSeqId,
+            tag: String::new(),
+            results: vec![OperationResult::Close {
+                status: Status::BadSeqId,
+                stateid: None,
+            }],
+        };
+        assert!(!response_consumed_owner_seqid(&bad_seqid, OpCode::Close));
+    }
+
+    #[test]
+    fn derives_payload_limit_from_session_channel_size() {
+        assert_eq!(session_payload_limit(0), 1);
+        assert_eq!(session_payload_limit(4096), 1);
+        assert_eq!(session_payload_limit(8192), 4096);
+        assert_eq!(session_payload_limit(u32::MAX), NFS4_MAX_IO as u32);
+    }
+
+    #[test]
     fn detects_retryable_delay_and_grace_statuses() {
         let response = CompoundResponse {
             status: Status::Delay,
@@ -546,6 +755,44 @@ mod tests {
     }
 
     #[test]
+    fn does_not_treat_session_recovery_status_as_delay_retry() {
+        let failed_sequence = CompoundResponse {
+            status: Status::BadSession,
+            tag: String::new(),
+            results: vec![OperationResult::Sequence {
+                status: Status::BadSession,
+                result: None,
+            }],
+        };
+        assert!(!response_has_retryable_status(&failed_sequence));
+        assert!(response_requires_session_recovery(&failed_sequence));
+
+        let failed_later_operation = CompoundResponse {
+            status: Status::BadSession,
+            tag: String::new(),
+            results: vec![
+                OperationResult::Sequence {
+                    status: Status::Ok,
+                    result: Some(SequenceResult {
+                        session_id: [1; NFS4_SESSIONID_SIZE],
+                        sequence_id: 1,
+                        slot_id: 0,
+                        highest_slot_id: 0,
+                        target_highest_slot_id: 0,
+                        status_flags: 0,
+                    }),
+                },
+                OperationResult::StatusOnly {
+                    op: OpCode::GetFh,
+                    status: Status::BadSession,
+                },
+            ],
+        };
+        assert!(!response_has_retryable_status(&failed_later_operation));
+        assert!(!response_requires_session_recovery(&failed_later_operation));
+    }
+
+    #[test]
     fn accepts_reclaim_complete_already_during_session_setup() {
         let complete_already = CompoundResponse {
             status: Status::CompleteAlready,
@@ -566,6 +813,31 @@ mod tests {
             }],
         };
         assert!(ensure_reclaim_complete(&wrong_sec).is_err());
+    }
+
+    #[test]
+    fn clamps_session_max_operations_to_protocol_limit() {
+        let mut attrs = ChannelAttrs::fore_channel_default();
+        attrs.max_operations = 32;
+        assert_eq!(session_max_operations(&attrs).unwrap(), 32);
+
+        attrs.max_operations = (NFS4_MAX_OPS as u32) + 1;
+        assert_eq!(session_max_operations(&attrs).unwrap(), NFS4_MAX_OPS);
+
+        attrs.max_operations = 0;
+        assert!(matches!(
+            session_max_operations(&attrs),
+            Err(Error::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn validates_session_compound_operation_count_with_sequence() {
+        assert!(validate_session_compound_operation_count(3, 4).is_ok());
+        assert!(matches!(
+            validate_session_compound_operation_count(4, 4),
+            Err(Error::Protocol(_))
+        ));
     }
 
     #[test]
@@ -609,6 +881,76 @@ mod tests {
             results: Vec::new(),
         };
         assert!(response_requires_session_recovery(&empty_compound_failure));
+    }
+
+    #[test]
+    fn classifies_session_recovery_replay_safety_conservatively() {
+        assert!(operations_can_replay_after_session_recovery(&[
+            Operation::PutRootFh,
+            Operation::Lookup("dir".to_owned()),
+            Operation::GetAttr(Bitmap::empty()),
+        ]));
+        assert!(operations_can_replay_after_session_recovery(&[
+            Operation::PutFh(FileHandle::new(vec![1]).unwrap()),
+            Operation::Read {
+                stateid: StateId::anonymous(),
+                offset: 0,
+                count: 1,
+            },
+        ]));
+        assert!(!operations_can_replay_after_session_recovery(&[
+            Operation::Open(OpenArgs {
+                seqid: 1,
+                share_access: OPEN4_SHARE_ACCESS_READ,
+                share_deny: OPEN4_SHARE_DENY_NONE,
+                owner: OpenOwner {
+                    client_id: 1,
+                    owner: b"owner".to_vec(),
+                },
+                openhow: OpenHow::NoCreate,
+                claim: OpenClaim::Null("file".to_owned()),
+            }),
+            Operation::GetFh,
+        ]));
+        assert!(!operations_can_replay_after_session_recovery(&[
+            Operation::PutRootFh,
+            Operation::Lookup("dir".to_owned()),
+            Operation::Create(CreateArgs {
+                kind: CreateKind::Directory,
+                name: "file".to_owned(),
+                attrs: Fattr::empty(),
+            }),
+        ]));
+        assert!(!operations_can_replay_after_session_recovery(&[
+            Operation::PutRootFh,
+            Operation::Lookup("dir".to_owned()),
+            Operation::Remove("file".to_owned()),
+        ]));
+        assert!(!operations_can_replay_after_session_recovery(&[
+            Operation::PutFh(FileHandle::new(vec![1]).unwrap()),
+            Operation::SetAttr {
+                stateid: StateId::anonymous(),
+                attrs: Fattr::size(1),
+            },
+        ]));
+        assert!(!operations_can_replay_after_session_recovery(&[
+            Operation::PutFh(FileHandle::new(vec![1]).unwrap()),
+            Operation::Commit {
+                offset: 0,
+                count: 0,
+            },
+        ]));
+        assert!(!operations_can_replay_after_session_recovery(&[
+            Operation::PutFh(FileHandle::new(vec![1]).unwrap()),
+            Operation::Read {
+                stateid: StateId {
+                    seqid: 1,
+                    other: [7; 12],
+                },
+                offset: 0,
+                count: 1,
+            },
+        ]));
     }
 
     #[test]

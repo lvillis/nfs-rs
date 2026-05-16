@@ -55,6 +55,7 @@ pub(crate) const MAX_NAME_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_PATH_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_IO_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const MAX_DIR_ENTRIES: usize = 1_000_000;
+pub const NFS3_NSECONDS_PER_SECOND: u32 = 1_000_000_000;
 
 /// NFSv3 directory cookie verifier.
 pub type CookieVerf = [u8; NFS3_COOKIEVERFSIZE];
@@ -304,23 +305,33 @@ impl Encode for SpecData {
 pub struct NfsTime {
     /// Seconds since the Unix epoch.
     pub seconds: u32,
-    /// Nanoseconds within the second.
+    /// Nanoseconds within the second. Must be less than
+    /// [`NFS3_NSECONDS_PER_SECOND`] when encoded.
     pub nseconds: u32,
 }
 
 impl Decode for NfsTime {
     fn decode(decoder: &mut Decoder<'_>) -> crate::xdr::Result<Self> {
-        Ok(Self {
+        let time = Self {
             seconds: u32::decode(decoder)?,
             nseconds: u32::decode(decoder)?,
-        })
+        };
+        time.validate()?;
+        Ok(time)
     }
 }
 
 impl Encode for NfsTime {
     fn encode(&self, encoder: &mut Encoder) -> crate::xdr::Result<()> {
+        self.validate()?;
         self.seconds.encode(encoder)?;
         self.nseconds.encode(encoder)
+    }
+}
+
+impl NfsTime {
+    pub(crate) fn validate(self) -> crate::xdr::Result<()> {
+        validate_nseconds(self.nseconds)
     }
 }
 
@@ -1446,9 +1457,20 @@ fn encode_set_time(encoder: &mut Encoder, value: SetTime) -> crate::xdr::Result<
         SetTime::DontChange => encoder.write_discriminant(0),
         SetTime::ServerTime => encoder.write_discriminant(1),
         SetTime::ClientTime(time) => {
+            time.validate()?;
             encoder.write_discriminant(2);
             time.encode(encoder)?;
         }
+    }
+    Ok(())
+}
+
+fn validate_nseconds(nseconds: u32) -> crate::xdr::Result<()> {
+    if nseconds >= NFS3_NSECONDS_PER_SECOND {
+        return Err(crate::xdr::Error::LengthLimitExceeded {
+            len: nseconds as usize,
+            max: (NFS3_NSECONDS_PER_SECOND - 1) as usize,
+        });
     }
     Ok(())
 }

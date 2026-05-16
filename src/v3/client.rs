@@ -35,15 +35,31 @@ impl RemoteTarget {
                 .split_once(':')
                 .ok_or_else(|| Error::InvalidTarget(target.to_owned()))?
         };
-        if host.is_empty() || export.is_empty() || !export.starts_with('/') {
-            return Err(Error::InvalidTarget(target.to_owned()));
-        }
-
-        Ok(Self {
+        let parsed = Self {
             host: host.to_owned(),
             export: export.to_owned(),
-        })
+        };
+        validate_remote_target(&parsed).map_err(|_| Error::InvalidTarget(target.to_owned()))?;
+        Ok(parsed)
     }
+}
+
+pub(crate) fn validate_remote_target(target: &RemoteTarget) -> Result<()> {
+    if target.host.trim().is_empty() || target.export.is_empty() || !target.export.starts_with('/')
+    {
+        return Err(Error::InvalidTarget(format!(
+            "{}:{}",
+            target.host, target.export
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_port(name: &'static str, port: u16) -> Result<()> {
+    if port == 0 {
+        return Err(Error::Protocol(format!("{name} must be non-zero")));
+    }
+    Ok(())
 }
 
 /// Directory entry returned by NFSv3 directory reads.
@@ -232,6 +248,40 @@ mod tests {
         assert!(matches!(
             normalize_path("/safe/../x"),
             Err(Error::InvalidPath(_))
+        ));
+    }
+
+    #[test]
+    fn validates_remote_targets_built_from_parts() {
+        assert!(
+            validate_remote_target(&RemoteTarget {
+                host: "127.0.0.1".to_owned(),
+                export: "/export".to_owned(),
+            })
+            .is_ok()
+        );
+        assert!(matches!(
+            validate_remote_target(&RemoteTarget {
+                host: " ".to_owned(),
+                export: "/export".to_owned(),
+            }),
+            Err(Error::InvalidTarget(_))
+        ));
+        assert!(matches!(
+            validate_remote_target(&RemoteTarget {
+                host: "127.0.0.1".to_owned(),
+                export: "relative".to_owned(),
+            }),
+            Err(Error::InvalidTarget(_))
+        ));
+    }
+
+    #[test]
+    fn validates_remote_ports() {
+        assert!(validate_port("nfs_port", 2049).is_ok());
+        assert!(matches!(
+            validate_port("nfs_port", 0),
+            Err(Error::Protocol(_))
         ));
     }
 

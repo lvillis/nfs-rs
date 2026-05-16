@@ -1457,6 +1457,29 @@ fn decodes_link_result() {
 }
 
 #[test]
+fn decodes_failed_setattr_without_success_bitmap() {
+    let mut wire = Encoder::new();
+    wire.write_u32(Status::AttrNotSupp.as_u32());
+    wire.write_string("t", 1024).unwrap();
+    wire.write_u32(1); // result count
+    wire.write_u32(OpCode::SetAttr.as_u32());
+    wire.write_u32(Status::AttrNotSupp.as_u32());
+
+    let bytes = wire.into_bytes();
+    let mut decoder = Decoder::new(&bytes);
+    let response = CompoundResponse::decode(&mut decoder).unwrap();
+    decoder.finish().unwrap();
+
+    assert!(matches!(
+        response.results.first(),
+        Some(OperationResult::StatusOnly {
+            op: OpCode::SetAttr,
+            status: Status::AttrNotSupp,
+        })
+    ));
+}
+
+#[test]
 fn decodes_commit_result() {
     let mut wire = Encoder::new();
     wire.write_u32(0); // compound status
@@ -1643,6 +1666,29 @@ fn decodes_v42_data_range_results() {
             && result.count == 4096
             && result.committed == StableHow::DataSync
             && result.verifier == [16; 8]
+    ));
+}
+
+#[test]
+fn rejects_unknown_read_plus_content_arm() {
+    let mut wire = Encoder::new();
+    wire.write_u32(0); // compound status
+    wire.write_string("t", 1024).unwrap();
+    wire.write_u32(1); // result count
+    wire.write_u32(OpCode::ReadPlus.as_u32());
+    wire.write_u32(Status::Ok.as_u32());
+    wire.write_bool(false); // eof
+    wire.write_u32(1); // content count
+    wire.write_u32(99); // unknown data_content4 arm
+
+    let bytes = wire.into_bytes();
+    let mut decoder = Decoder::new(&bytes);
+    assert!(matches!(
+        CompoundResponse::decode(&mut decoder),
+        Err(nfs::xdr::Error::InvalidDiscriminant {
+            type_name: "data_content4",
+            value: 99,
+        })
     ));
 }
 

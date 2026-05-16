@@ -16,6 +16,7 @@ fn rfc7530_8881_7862_program_constants_match_spec() {
     assert_eq!(NFS4_SESSIONID_SIZE, 16);
     assert_eq!(NFS4_DEVICEID_SIZE, 16);
     assert_eq!(NFS4_OPAQUE_LIMIT, 1024);
+    assert_eq!(NFS4_NSECONDS_PER_SECOND, 1_000_000_000);
     assert_eq!(NFS4_MAX_SECINFO_FLAVORS, 128);
     assert_eq!(NFS4_MAX_NETLOCATIONS, 128);
     assert_eq!(NFS4_MAX_CALLBACK_SEC_PARMS, 16);
@@ -382,6 +383,9 @@ fn rfc8881_session_and_state_statuses_are_classified() {
     assert!(Status::DeadSession.requires_session_recovery());
     assert!(Status::StaleClientId.requires_session_recovery());
     assert!(!Status::BadStateId.requires_session_recovery());
+    assert!(Status::Delay.is_retryable());
+    assert!(Status::Grace.is_retryable());
+    assert!(!Status::BadSession.is_retryable());
 
     assert!(Status::AdminRevoked.indicates_lost_state());
     assert!(Status::BadStateId.indicates_lost_state());

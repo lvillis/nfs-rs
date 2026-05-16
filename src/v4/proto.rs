@@ -32,6 +32,7 @@ pub const NFS4_INT32_MAX: i32 = 0x7fff_ffff;
 pub const NFS4_UINT32_MAX: u32 = 0xffff_ffff;
 pub const NFS4_MAXFILELEN: u64 = 0xffff_ffff_ffff_ffff;
 pub const NFS4_MAXFILEOFF: u64 = 0xffff_ffff_ffff_fffe;
+pub const NFS4_NSECONDS_PER_SECOND: u32 = 1_000_000_000;
 
 const DEFAULT_SESSION_CHANNEL_SIZE: u32 = 1024 * 1024;
 
@@ -604,8 +605,12 @@ impl Status {
     }
 
     /// Returns true when the same operation can be retried after a delay.
+    ///
+    /// Session recovery statuses are intentionally excluded here because safe
+    /// replay depends on the operation and client state. Use
+    /// [`Status::requires_session_recovery`] for those statuses.
     pub fn is_retryable(self) -> bool {
-        matches!(self, Self::Delay | Self::Grace) || self.requires_session_recovery()
+        matches!(self, Self::Delay | Self::Grace)
     }
 
     /// Returns true when the client should create a new session and retry.
@@ -918,6 +923,10 @@ impl StateId {
             other: [0; 12],
         }
     }
+
+    pub fn is_anonymous(self) -> bool {
+        self == Self::anonymous()
+    }
 }
 
 impl Encode for StateId {
@@ -1161,11 +1170,11 @@ impl Fattr {
         }
         if attrs.access_time != SetTime::DontChange {
             attr_ids.push(FATTR4_TIME_ACCESS_SET);
-            encode_set_time(&mut encoder, attrs.access_time);
+            encode_set_time(&mut encoder, attrs.access_time)?;
         }
         if attrs.modify_time != SetTime::DontChange {
             attr_ids.push(FATTR4_TIME_MODIFY_SET);
-            encode_set_time(&mut encoder, attrs.modify_time);
+            encode_set_time(&mut encoder, attrs.modify_time)?;
         }
 
         Ok(Self {
@@ -1549,36 +1558,57 @@ pub struct PathConf {
 pub struct NfsTime {
     /// Seconds since the Unix epoch.
     pub seconds: i64,
-    /// Nanoseconds within the second.
+    /// Nanoseconds within the second. Must be less than
+    /// [`NFS4_NSECONDS_PER_SECOND`] when encoded.
     pub nseconds: u32,
 }
 
 impl Decode for NfsTime {
     fn decode(decoder: &mut Decoder<'_>) -> crate::xdr::Result<Self> {
-        Ok(Self {
+        let time = Self {
             seconds: decoder.read_i64()?,
             nseconds: decoder.read_u32()?,
-        })
+        };
+        time.validate()?;
+        Ok(time)
     }
 }
 
 impl Encode for NfsTime {
     fn encode(&self, encoder: &mut Encoder) -> crate::xdr::Result<()> {
+        self.validate()?;
         encoder.write_i64(self.seconds);
         encoder.write_u32(self.nseconds);
         Ok(())
     }
 }
 
-fn encode_set_time(encoder: &mut Encoder, value: SetTime) {
+impl NfsTime {
+    pub(crate) fn validate(self) -> crate::xdr::Result<()> {
+        validate_nseconds(self.nseconds)
+    }
+}
+
+fn encode_set_time(encoder: &mut Encoder, value: SetTime) -> crate::xdr::Result<()> {
     match value {
         SetTime::DontChange | SetTime::ServerTime => encoder.write_u32(0),
         SetTime::ClientTime(time) => {
+            time.validate()?;
             encoder.write_u32(1);
-            encoder.write_i64(time.seconds);
-            encoder.write_u32(time.nseconds);
+            time.encode(encoder)?;
         }
     }
+    Ok(())
+}
+
+fn validate_nseconds(nseconds: u32) -> crate::xdr::Result<()> {
+    if nseconds >= NFS4_NSECONDS_PER_SECOND {
+        return Err(crate::xdr::Error::LengthLimitExceeded {
+            len: nseconds as usize,
+            max: (NFS4_NSECONDS_PER_SECOND - 1) as usize,
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2925,8 +2955,6 @@ pub enum ReadPlusContent {
     Data { offset: u64, data: Vec<u8> },
     /// A hole segment with its file offset and length.
     Hole { offset: u64, length: u64 },
-    /// A future content arm with no payload in the current minor version.
-    Unknown(u32),
 }
 
 impl Decode for ReadPlusContent {
@@ -2940,7 +2968,10 @@ impl Decode for ReadPlusContent {
                 offset: decoder.read_u64()?,
                 length: decoder.read_u64()?,
             }),
-            value => Ok(Self::Unknown(value)),
+            value => Err(crate::xdr::Error::InvalidDiscriminant {
+                type_name: "data_content4",
+                value: value as i32,
+            }),
         }
     }
 }
@@ -4722,7 +4753,9 @@ impl Decode for OperationResult {
                 Ok(Self::WriteSame { status, result })
             }
             OpCode::SetAttr => {
-                Bitmap::decode(decoder)?;
+                if status.is_ok() {
+                    Bitmap::decode(decoder)?;
+                }
                 Ok(Self::StatusOnly { op, status })
             }
             OpCode::Remove => {

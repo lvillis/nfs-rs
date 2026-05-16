@@ -57,4 +57,4 @@ pub mod xdr;
 
 pub use error::{Error, Result};
 pub use retry::RetryPolicy;
-pub use rpc::{AUTH_SYS_MAX_GROUPS, AuthSys};
+pub use rpc::{AUTH_SYS_MACHINE_NAME_MAX, AUTH_SYS_MAX_GROUPS, AuthSys};

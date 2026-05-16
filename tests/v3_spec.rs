@@ -12,6 +12,7 @@ fn rfc1813_program_constants_match_spec() {
     assert_eq!(NFS3_COOKIEVERFSIZE, 8);
     assert_eq!(NFS3_CREATEVERFSIZE, 8);
     assert_eq!(NFS3_WRITEVERFSIZE, 8);
+    assert_eq!(NFS3_NSECONDS_PER_SECOND, 1_000_000_000);
 
     assert_eq!(MOUNT_PROGRAM, 100005);
     assert_eq!(MOUNT_VERSION, 3);

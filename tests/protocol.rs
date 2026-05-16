@@ -6,8 +6,8 @@ use nfs::v3::protocol::{CreateHow, FileHandle};
 use nfs::v3::{FileType, MountStatus, NfsStatus, NfsTime, RemoteTarget, SetAttr, SetTime};
 use nfs::v4::Status;
 use nfs::xdr;
-use nfs::xdr::to_bytes;
-use nfs::{AUTH_SYS_MAX_GROUPS, AuthSys, Error};
+use nfs::xdr::{from_bytes, to_bytes};
+use nfs::{AUTH_SYS_MACHINE_NAME_MAX, AUTH_SYS_MAX_GROUPS, AuthSys, Error};
 
 #[test]
 fn parses_remote_targets() {
@@ -115,18 +115,17 @@ fn classifies_operational_error_semantics() {
     );
     assert!(
         Error::NfsV4 {
-            operation: "SEQUENCE",
-            status: Status::BadSession,
-        }
-        .is_retryable()
-    );
-    assert!(
-        Error::NfsV4 {
             operation: "READ",
             status: Status::Delay,
         }
         .is_retryable()
     );
+    let bad_session = Error::NfsV4 {
+        operation: "SEQUENCE",
+        status: Status::BadSession,
+    };
+    assert!(!bad_session.is_retryable());
+    assert!(bad_session.requires_session_recovery());
 
     assert!(
         Error::Nfs {
@@ -244,6 +243,47 @@ fn encodes_setattr_discriminated_unions() {
 }
 
 #[test]
+fn rejects_invalid_nfs_timestamp_nanoseconds() {
+    let invalid_v3_time = NfsTime {
+        seconds: 7,
+        nseconds: nfs::v3::NFS3_NSECONDS_PER_SECOND,
+    };
+    assert!(matches!(
+        to_bytes(&invalid_v3_time),
+        Err(xdr::Error::LengthLimitExceeded { .. })
+    ));
+    assert!(matches!(
+        from_bytes::<NfsTime>(&[0, 0, 0, 7, 0x3b, 0x9a, 0xca, 0x00]),
+        Err(xdr::Error::LengthLimitExceeded { .. })
+    ));
+
+    let invalid_v3_attr = SetAttr::times(Some(invalid_v3_time), None);
+    assert!(matches!(
+        to_bytes(&invalid_v3_attr),
+        Err(xdr::Error::LengthLimitExceeded { .. })
+    ));
+
+    let invalid_v4_time = nfs::v4::NfsTime {
+        seconds: 7,
+        nseconds: nfs::v4::NFS4_NSECONDS_PER_SECOND,
+    };
+    assert!(matches!(
+        to_bytes(&invalid_v4_time),
+        Err(xdr::Error::LengthLimitExceeded { .. })
+    ));
+    assert!(matches!(
+        from_bytes::<nfs::v4::NfsTime>(&[0, 0, 0, 0, 0, 0, 0, 7, 0x3b, 0x9a, 0xca, 0x00]),
+        Err(xdr::Error::LengthLimitExceeded { .. })
+    ));
+
+    let invalid_v4_attrs = nfs::v4::SetAttrs::times(Some(invalid_v4_time), None);
+    assert!(matches!(
+        nfs::v4::Fattr::from_set_attrs(&invalid_v4_attrs),
+        Err(Error::Xdr(xdr::Error::LengthLimitExceeded { .. }))
+    ));
+}
+
+#[test]
 fn encodes_exclusive_create_mode() {
     let how = CreateHow::Exclusive([1, 2, 3, 4, 5, 6, 7, 8]);
     assert_eq!(
@@ -254,6 +294,7 @@ fn encodes_exclusive_create_mode() {
 
 #[test]
 fn encodes_auth_sys_credentials() {
+    assert_eq!(AUTH_SYS_MACHINE_NAME_MAX, 255);
     assert_eq!(AUTH_SYS_MAX_GROUPS, 16);
 
     let auth = AuthSys {

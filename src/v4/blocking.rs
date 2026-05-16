@@ -18,18 +18,21 @@ use crate::error::{Error, Result};
 use crate::retry::RetryPolicy;
 use crate::rpc::{Auth, AuthSys, RpcClient, max_record_size_for_payloads};
 use crate::v4::client::{
-    SpaceOp, advance_offset, dir_page_from_entries, ensure_last_status, ensure_reclaim_complete,
-    finish_with_close, join_path, path_components, path_ops, response_access, response_commit,
-    response_create_session, response_exchange_id, response_getattr, response_getfh,
-    response_has_retryable_status, response_open, response_read, response_readdir,
-    response_readlink, response_requires_session_recovery, response_seek, response_write,
-    sequence_succeeded, split_parent, temporary_sibling_path, verifier_from_time,
+    SpaceOp, advance_offset, attrs_require_open_state, dir_page_from_entries, ensure_last_status,
+    ensure_reclaim_complete, finish_with_close, join_path,
+    operations_can_replay_after_session_recovery, path_components, path_ops, response_access,
+    response_commit, response_consumed_owner_seqid, response_create_session, response_exchange_id,
+    response_getattr, response_getfh, response_has_retryable_status, response_open, response_read,
+    response_readdir, response_readlink, response_requires_session_recovery, response_seek,
+    response_write, sequence_succeeded, session_max_operations, session_payload_limit,
+    session_recovery_error, split_parent, temporary_sibling_path,
+    validate_session_compound_operation_count, verifier_from_time,
 };
 use crate::v4::proto::*;
 use crate::v4::{
     clamp_io_size, default_open_owner, default_owner_id, negotiated_minor_versions,
-    require_minor_version, validate_max_dir_entries, validate_minor_version, validate_open_owner,
-    validate_owner_id, validate_transfer_size,
+    require_minor_version, validate_host, validate_max_dir_entries, validate_minor_version,
+    validate_open_owner, validate_owner_id, validate_port, validate_transfer_size,
 };
 use crate::xdr::{Decode, Decoder};
 
@@ -187,6 +190,9 @@ pub struct Client {
     open_seqid: u32,
     open_owner: Vec<u8>,
     minor_version: u32,
+    max_operations: usize,
+    max_request_size: u32,
+    max_response_size: u32,
     root_fsinfo: Option<FsInfo>,
     read_size: u32,
     write_size: u32,
@@ -294,25 +300,15 @@ impl Client {
         let previous_client_id = self.client_id;
         let previous_open_seqid = self.open_seqid;
         let previous_root_fsinfo = self.root_fsinfo.clone();
-        let previous_read_size = self.read_size;
-        let previous_write_size = self.write_size;
-        let previous_dir_size = self.dir_size;
 
         let mut rebuilt = Self::connect_session(self.builder.clone())?;
         if rebuilt.client_id == previous_client_id {
             rebuilt.open_seqid = previous_open_seqid;
         }
-        rebuilt.root_fsinfo = previous_root_fsinfo;
-        rebuilt.read_size = previous_read_size;
-        rebuilt.write_size = previous_write_size;
-        rebuilt.dir_size = previous_dir_size;
-        rebuilt
-            .rpc
-            .set_max_record_size(max_record_size_for_payloads(&[
-                rebuilt.read_size,
-                rebuilt.write_size,
-                rebuilt.dir_size,
-            ]));
+        if let Some(fsinfo) = previous_root_fsinfo {
+            rebuilt.apply_fsinfo_limits(&fsinfo);
+            rebuilt.root_fsinfo = Some(fsinfo);
+        }
         *self = rebuilt;
         Ok(())
     }
@@ -702,6 +698,12 @@ impl Client {
         let attrs = Fattr::from_set_attrs(attrs)?;
         if attrs.attrmask.is_empty() {
             return Ok(());
+        }
+        if attrs_require_open_state(&attrs) {
+            let opened = self.open(path, OPEN4_SHARE_ACCESS_WRITE, OpenHow::NoCreate)?;
+            let result = self.set_opened_attrs(&opened, attrs);
+            let close_result = self.close(opened);
+            return finish_with_close(result, close_result);
         }
         let response = self.compound(path_ops(
             path,
@@ -1158,6 +1160,15 @@ impl Client {
     }
 
     fn compound(&mut self, operations: Vec<Operation>) -> Result<CompoundResponse> {
+        let response = self.compound_status(operations)?;
+        response.ensure_ok()?;
+        Ok(response)
+    }
+
+    fn compound_status(&mut self, operations: Vec<Operation>) -> Result<CompoundResponse> {
+        validate_session_compound_operation_count(operations.len(), self.max_operations)?;
+        let can_replay_after_session_recovery =
+            operations_can_replay_after_session_recovery(&operations);
         let mut retry = 0;
         let mut recovered_session = false;
         loop {
@@ -1176,8 +1187,12 @@ impl Client {
                 self.sequence_id = self.sequence_id.wrapping_add(1).max(1);
             }
             if response_requires_session_recovery(&response) && !recovered_session {
+                let err = session_recovery_error(&response);
                 self.reconnect()?;
                 recovered_session = true;
+                if !can_replay_after_session_recovery {
+                    return Err(err);
+                }
                 continue;
             }
             if response_has_retryable_status(&response)
@@ -1187,7 +1202,6 @@ impl Client {
                 std::thread::sleep(delay);
                 continue;
             }
-            response.ensure_ok()?;
             return Ok(response);
         }
     }
@@ -1199,6 +1213,8 @@ impl Client {
     }
 
     fn connect_session(builder: ClientBuilder) -> Result<Self> {
+        validate_host(&builder.host)?;
+        validate_port("port", builder.port)?;
         validate_owner_id(&builder.owner_id)?;
         validate_open_owner(&builder.open_owner)?;
         validate_transfer_size("read_size", builder.read_size)?;
@@ -1271,6 +1287,10 @@ impl Client {
         )?;
         session_res.ensure_ok()?;
         let session = response_create_session(&session_res)?;
+        let max_operations = session_max_operations(&session.fore_channel_attrs)?;
+        let max_request_size = session.fore_channel_attrs.max_request_size;
+        let max_response_size = session.fore_channel_attrs.max_response_size;
+        validate_session_compound_operation_count(1, max_operations)?;
 
         let reclaim_res = raw_compound_with_rpc(
             &mut rpc,
@@ -1298,6 +1318,9 @@ impl Client {
             open_seqid: 1,
             open_owner: builder.open_owner.clone(),
             minor_version,
+            max_operations,
+            max_request_size,
+            max_response_size,
             root_fsinfo: None,
             read_size: builder.read_size,
             write_size: builder.write_size,
@@ -1310,17 +1333,34 @@ impl Client {
     }
 
     fn refresh_root_fsinfo(&mut self) -> Result<()> {
-        self.root_fsinfo = Some(self.fsinfo("/")?);
-        if let Some(fsinfo) = &self.root_fsinfo {
-            self.read_size = clamp_io_size(fsinfo.max_read, self.builder.read_size);
-            self.write_size = clamp_io_size(fsinfo.max_write, self.builder.write_size);
-            self.rpc.set_max_record_size(max_record_size_for_payloads(&[
-                self.read_size,
-                self.write_size,
-                self.dir_size,
-            ]));
-        }
+        let fsinfo = self.fsinfo("/")?;
+        self.apply_fsinfo_limits(&fsinfo);
+        self.root_fsinfo = Some(fsinfo);
         Ok(())
+    }
+
+    fn apply_fsinfo_limits(&mut self, fsinfo: &FsInfo) {
+        let read_limit = self
+            .builder
+            .read_size
+            .min(session_payload_limit(self.max_response_size));
+        let write_limit = self
+            .builder
+            .write_size
+            .min(session_payload_limit(self.max_request_size));
+        let dir_limit = self
+            .builder
+            .dir_size
+            .min(session_payload_limit(self.max_response_size));
+
+        self.read_size = clamp_io_size(fsinfo.max_read, read_limit);
+        self.write_size = clamp_io_size(fsinfo.max_write, write_limit);
+        self.dir_size = dir_limit;
+        self.rpc.set_max_record_size(max_record_size_for_payloads(&[
+            self.read_size,
+            self.write_size,
+            self.dir_size,
+        ]));
     }
 
     fn raw_compound(
@@ -1342,12 +1382,13 @@ struct OpenedFile {
 impl Client {
     fn open(&mut self, path: &str, share_access: u32, openhow: OpenHow) -> Result<OpenedFile> {
         let (parent_components, file_name) = split_parent(path)?;
+        let seqid = self.current_open_seqid();
         let mut ops = vec![Operation::PutRootFh];
         for component in parent_components {
             ops.push(Operation::Lookup(component.to_owned()));
         }
         ops.push(Operation::Open(OpenArgs {
-            seqid: self.next_open_seqid(),
+            seqid,
             share_access: share_access | OPEN4_SHARE_ACCESS_WANT_NO_DELEG,
             share_deny: OPEN4_SHARE_DENY_NONE,
             owner: OpenOwner {
@@ -1359,7 +1400,11 @@ impl Client {
         }));
         ops.push(Operation::GetFh);
 
-        let response = self.compound(ops)?;
+        let response = self.compound_status(ops)?;
+        if response_consumed_owner_seqid(&response, OpCode::Open) {
+            self.advance_open_seqid();
+        }
+        response.ensure_ok()?;
         let open = response_open(&response)?;
         let handle = response_getfh(&response)?;
         Ok(OpenedFile {
@@ -1467,11 +1512,15 @@ impl Client {
     }
 
     fn set_opened_size(&mut self, opened: &OpenedFile, size: u64) -> Result<()> {
+        self.set_opened_attrs(opened, Fattr::size(size))
+    }
+
+    fn set_opened_attrs(&mut self, opened: &OpenedFile, attrs: Fattr) -> Result<()> {
         let setattr_response = self.compound(vec![
             Operation::PutFh(opened.handle.clone()),
             Operation::SetAttr {
                 stateid: opened.stateid,
-                attrs: Fattr::size(size),
+                attrs,
             },
         ])?;
         self.ensure_status(setattr_response, "SETATTR")
@@ -1619,14 +1668,18 @@ impl Client {
     }
 
     fn close(&mut self, opened: OpenedFile) -> Result<()> {
-        let seqid = self.next_open_seqid();
-        let response = self.compound(vec![
+        let seqid = self.current_open_seqid();
+        let response = self.compound_status(vec![
             Operation::PutFh(opened.handle),
             Operation::Close {
                 seqid,
                 stateid: opened.stateid,
             },
         ])?;
+        if response_consumed_owner_seqid(&response, OpCode::Close) {
+            self.advance_open_seqid();
+        }
+        response.ensure_ok()?;
         self.ensure_status(response, "CLOSE")
     }
 
@@ -1642,10 +1695,12 @@ impl Client {
         ensure_last_status(response, operation)
     }
 
-    fn next_open_seqid(&mut self) -> u32 {
-        let seqid = self.open_seqid;
+    fn current_open_seqid(&self) -> u32 {
+        self.open_seqid
+    }
+
+    fn advance_open_seqid(&mut self) {
         self.open_seqid = self.open_seqid.wrapping_add(1).max(1);
-        seqid
     }
 }
 
@@ -1701,6 +1756,18 @@ mod tests {
     #[test]
     fn v4_builder_rejects_invalid_transfer_size_before_network() {
         let result = Client::builder("127.0.0.1").read_size(0).connect();
+        assert!(matches!(result, Err(Error::Protocol(_))));
+    }
+
+    #[test]
+    fn v4_builder_rejects_empty_host_before_network() {
+        let result = Client::builder("").connect();
+        assert!(matches!(result, Err(Error::InvalidTarget(_))));
+    }
+
+    #[test]
+    fn v4_builder_rejects_zero_port_before_network() {
+        let result = Client::builder("127.0.0.1").port(0).connect();
         assert!(matches!(result, Err(Error::Protocol(_))));
     }
 

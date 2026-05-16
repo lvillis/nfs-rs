@@ -3,7 +3,9 @@ use std::time::Duration;
 /// Exponential backoff policy for retryable RPC/NFS responses.
 ///
 /// The high-level clients use this policy for conditions that are safe to
-/// retry, such as NFSv4 `Delay` responses and recoverable session failures.
+/// retry inside the client, such as NFSv3 `Jukebox` and NFSv4 `Delay` or
+/// `Grace` responses. NFSv4 session recovery is handled separately because
+/// replay safety depends on the operation and state involved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryPolicy {
     max_retries: u32,
