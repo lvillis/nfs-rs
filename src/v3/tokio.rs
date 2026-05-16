@@ -24,9 +24,10 @@ use crate::retry::RetryPolicy;
 use crate::rpc::{Auth, AuthSys, max_record_size_for_payloads};
 use crate::tokio_rpc::RpcClient;
 use crate::v3::client::{
-    advance_offset, append_dir_entries, clamp_dir_size, clamp_io_size, dir_page_from_batch,
-    join_path, normalize_path, temporary_sibling_path, validate_max_dir_entries, validate_port,
-    validate_remote_target, validate_transfer_size,
+    advance_offset, append_dir_entries, clamp_dir_size, clamp_io_size, cleanup_error,
+    dir_page_from_batch, ensure_distinct_copy_handles, join_path, next_dir_cursor, normalize_path,
+    temporary_sibling_path, validate_max_dir_entries, validate_port, validate_remote_target,
+    validate_transfer_size,
 };
 use crate::v3::mount::{MNTPATHLEN, MOUNT_PROGRAM, MOUNT_VERSION, MountInfo, MountStatus};
 use crate::v3::portmap::{IPPROTO_TCP, PMAP_PORT, PMAP_PROGRAM, PMAP_VERSION};
@@ -203,8 +204,8 @@ impl Nfs3Client {
         self.rpc.set_timeout(timeout);
     }
 
-    pub(crate) fn set_max_record_size(&mut self, max_record_size: usize) {
-        self.rpc.set_max_record_size(max_record_size);
+    pub(crate) fn set_max_record_size(&mut self, max_record_size: usize) -> Result<()> {
+        self.rpc.set_max_record_size(max_record_size)
     }
 
     pub(crate) fn set_retry_policy(&mut self, retry_policy: RetryPolicy) {
@@ -317,6 +318,7 @@ impl Nfs3Client {
     }
 
     pub async fn read(&mut self, file: &FileHandle, offset: u64, count: u32) -> Result<ReadResult> {
+        let requested_count = count;
         let payload = self
             .call(
                 nfs3::NFSPROC3_READ,
@@ -331,19 +333,14 @@ impl Nfs3Client {
         let status = nfs3::decode_status(&mut decoder)?;
         let file_attributes = nfs3::decode_post_op_attr(&mut decoder)?;
         if status == NfsStatus::Ok {
-            let count = u32::decode(&mut decoder)?;
+            let returned_count = u32::decode(&mut decoder)?;
             let eof = bool::decode(&mut decoder)?;
             let data = decoder.read_opaque_vec(MAX_IO_BYTES)?;
             decoder.finish()?;
-            if data.len() != count as usize {
-                return Err(Error::Protocol(format!(
-                    "READ returned count {count} but {} data bytes",
-                    data.len()
-                )));
-            }
+            nfs3::validate_read_result_size(requested_count, returned_count, data.len(), eof)?;
             Ok(ReadResult {
                 file_attributes,
-                count,
+                count: returned_count,
                 eof,
                 data,
             })
@@ -360,7 +357,7 @@ impl Nfs3Client {
         stable: StableHow,
         data: &[u8],
     ) -> Result<WriteResult> {
-        let count =
+        let requested_count =
             u32::try_from(data.len()).map_err(|_| Error::LengthOutOfRange { len: data.len() })?;
         let payload = self
             .call(
@@ -368,7 +365,7 @@ impl Nfs3Client {
                 &WriteArgs {
                     file,
                     offset,
-                    count,
+                    count: requested_count,
                     stable,
                     data,
                 },
@@ -378,13 +375,14 @@ impl Nfs3Client {
         let status = nfs3::decode_status(&mut decoder)?;
         let file_wcc = WccData::decode(&mut decoder)?;
         if status == NfsStatus::Ok {
-            let count = u32::decode(&mut decoder)?;
+            let returned_count = u32::decode(&mut decoder)?;
             let committed = StableHow::decode(&mut decoder)?;
             let verifier = nfs3::decode_writeverf(&mut decoder)?;
             decoder.finish()?;
+            nfs3::validate_write_result_count(requested_count, returned_count)?;
             Ok(WriteResult {
                 file_wcc,
-                count,
+                count: returned_count,
                 committed,
                 verifier,
             })
@@ -1187,10 +1185,13 @@ impl Client {
             Err(err) => Err(err),
         };
 
-        if result.is_err() && created {
-            let _ = self.remove(&temp).await;
-        }
-        result
+        self.finish_with_temp_cleanup(
+            result,
+            created,
+            &temp,
+            "cleanup REMOVE after failed atomic write",
+        )
+        .await
     }
 
     pub async fn write_atomic_from_reader<R: AsyncRead + Unpin + ?Sized>(
@@ -1256,10 +1257,13 @@ impl Client {
             Err(err) => Err(err),
         };
 
-        if result.is_err() && created {
-            let _ = self.remove(&temp).await;
-        }
-        result
+        self.finish_with_temp_cleanup(
+            result,
+            created,
+            &temp,
+            "cleanup REMOVE after failed atomic reader write",
+        )
+        .await
     }
 
     pub async fn append(&mut self, path: &str, data: &[u8]) -> Result<u64> {
@@ -1402,6 +1406,7 @@ impl Client {
             }
             Err(err) => return Err(err),
         };
+        ensure_distinct_copy_handles(&source, &target)?;
 
         self.nfs.setattr(&target, &SetAttr::size(0)).await?;
         self.copy_handles(&source, &target, stable).await
@@ -1445,10 +1450,13 @@ impl Client {
             Err(err) => Err(err),
         };
 
-        if result.is_err() && created {
-            let _ = self.remove(&temp).await;
-        }
-        result
+        self.finish_with_temp_cleanup(
+            result,
+            created,
+            &temp,
+            "cleanup REMOVE after failed atomic copy",
+        )
+        .await
     }
 
     pub async fn commit(&mut self, path: &str, offset: u64, count: u32) -> Result<CommitResult> {
@@ -1487,6 +1495,22 @@ impl Client {
         result
             .object
             .ok_or_else(|| Error::Protocol("CREATE succeeded without a file handle".into()))
+    }
+
+    async fn finish_with_temp_cleanup<T>(
+        &mut self,
+        result: Result<T>,
+        created: bool,
+        temp: &str,
+        cleanup_context: &'static str,
+    ) -> Result<T> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(err) if created => {
+                Err(cleanup_error(err, cleanup_context, self.remove(temp).await))
+            }
+            Err(err) => Err(err),
+        }
     }
 
     pub async fn mkdir(&mut self, path: &str, mode: u32) -> Result<()> {
@@ -1700,7 +1724,7 @@ impl Client {
             }
             Err(err) => return Err(err),
         };
-        dir_page_from_batch(&batch, max_entries)
+        dir_page_from_batch(&batch, cursor.cookie, max_entries)
     }
 
     async fn read_dir_with_limit(
@@ -1732,16 +1756,12 @@ impl Client {
             };
 
             append_dir_entries(&mut entries, &batch, max_entries)?;
-            if batch.eof {
-                break;
-            }
-            if let Some(last) = batch.entries.last() {
-                cookie = last.cookie;
-                cookieverf = batch.cookieverf;
-            } else {
-                return Err(Error::Protocol(
-                    "READDIR returned no entries before EOF".to_owned(),
-                ));
+            match next_dir_cursor(&batch, cookie)? {
+                Some(next) => {
+                    cookie = next.cookie;
+                    cookieverf = next.cookieverf;
+                }
+                None => break,
             }
         }
 
@@ -1831,7 +1851,7 @@ impl Client {
             .unwrap_or(dir_size_limit);
         nfs.set_max_record_size(max_record_size_for_payloads(&[
             read_size, write_size, dir_size,
-        ]));
+        ]))?;
 
         Ok(Self {
             builder: stored_builder,

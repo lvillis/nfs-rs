@@ -58,10 +58,77 @@ fn owner_seqid_status_consumes(status: Status) -> bool {
 
 const NFS4_COMPOUND_IO_HEADROOM: u32 = 4096;
 
+pub(crate) fn validate_compound_response_shape(
+    tag: &str,
+    expected: &[OpCode],
+    response: &CompoundResponse,
+) -> Result<()> {
+    if response.results.len() > expected.len() {
+        return Err(Error::Protocol(format!(
+            "NFSv4 COMPOUND {tag:?} returned {} operation results for {} requests",
+            response.results.len(),
+            expected.len()
+        )));
+    }
+
+    for (index, (result, expected)) in response.results.iter().zip(expected).enumerate() {
+        let actual = result.op_code();
+        if !compound_result_matches_expected(result, *expected) {
+            return Err(Error::Protocol(format!(
+                "NFSv4 COMPOUND {tag:?} result {index} is {}, expected {}",
+                actual.name(),
+                expected.name()
+            )));
+        }
+    }
+
+    if response.status.is_ok() && response.results.len() != expected.len() {
+        return Err(Error::Protocol(format!(
+            "NFSv4 COMPOUND {tag:?} succeeded with {} operation results for {} requests",
+            response.results.len(),
+            expected.len()
+        )));
+    }
+
+    let failed = response
+        .results
+        .iter()
+        .position(|result| !result.status().is_ok());
+    match (response.status.is_ok(), failed) {
+        (true, Some(index)) => Err(Error::Protocol(format!(
+            "NFSv4 COMPOUND {tag:?} has OK compound status but result {index} failed with {:?}",
+            response.results[index].status()
+        ))),
+        (false, Some(index)) if index + 1 != response.results.len() => {
+            Err(Error::Protocol(format!(
+                "NFSv4 COMPOUND {tag:?} has non-final failed result {index} with {:?}",
+                response.results[index].status()
+            )))
+        }
+        (false, Some(index)) if response.results[index].status() != response.status => {
+            Err(Error::Protocol(format!(
+                "NFSv4 COMPOUND {tag:?} status {:?} does not match final result status {:?}",
+                response.status,
+                response.results[index].status()
+            )))
+        }
+        (false, None) if !response.results.is_empty() => Err(Error::Protocol(format!(
+            "NFSv4 COMPOUND {tag:?} failed with {:?}, but all operation results were OK",
+            response.status
+        ))),
+        _ => Ok(()),
+    }
+}
+
+fn compound_result_matches_expected(result: &OperationResult, expected: OpCode) -> bool {
+    result.op_code() == expected
+        || (result.op_code() == OpCode::Illegal && result.status() == Status::OpIllegal)
+}
+
 pub(crate) fn session_payload_limit(channel_size: u32) -> u32 {
     channel_size
         .saturating_sub(NFS4_COMPOUND_IO_HEADROOM)
-        .clamp(1, NFS4_MAX_IO as u32)
+        .min(NFS4_MAX_IO as u32)
 }
 
 pub(crate) fn operations_can_replay_after_session_recovery(operations: &[Operation]) -> bool {
@@ -169,6 +236,26 @@ pub(crate) fn session_max_operations(attrs: &ChannelAttrs) -> Result<usize> {
         ));
     }
     Ok(max_operations.min(NFS4_MAX_OPS))
+}
+
+pub(crate) fn validate_session_channel_attrs(attrs: &ChannelAttrs) -> Result<()> {
+    validate_session_channel_size("max_request_size", attrs.max_request_size)?;
+    validate_session_channel_size("max_response_size", attrs.max_response_size)?;
+    if attrs.max_requests == 0 {
+        return Err(Error::Protocol(
+            "NFSv4 session fore channel returned max_requests=0".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_session_channel_size(name: &'static str, size: u32) -> Result<()> {
+    if size <= NFS4_COMPOUND_IO_HEADROOM {
+        return Err(Error::Protocol(format!(
+            "NFSv4 session fore channel returned {name}={size}, which leaves no payload capacity"
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_session_compound_operation_count(
@@ -289,7 +376,11 @@ pub(crate) fn finish_with_close<T>(result: Result<T>, close_result: Result<()>) 
             close_result?;
             Ok(value)
         }
-        Err(err) => Err(err),
+        Err(err) => Err(cleanup_error(
+            err,
+            "cleanup CLOSE after failed operation",
+            close_result,
+        )),
     }
 }
 
@@ -426,6 +517,57 @@ pub(crate) fn response_open(response: &CompoundResponse) -> Result<OpenResult> {
         .ok_or_else(|| Error::Protocol("COMPOUND did not include OPEN result".into()))?
 }
 
+pub(crate) fn validate_open_result(
+    open: &OpenResult,
+    minor_version: u32,
+) -> Result<Option<StateId>> {
+    if minor_version >= NFS4_MINOR_VERSION_SESSION_MIN
+        && (open.result_flags & OPEN4_RESULT_CONFIRM) != 0
+    {
+        return Err(Error::Protocol(
+            "NFSv4 server requested OPEN_CONFIRM for a session minor version".to_owned(),
+        ));
+    }
+
+    Ok(open_delegation_stateid(&open.delegation))
+}
+
+fn open_delegation_stateid(delegation: &OpenDelegation) -> Option<StateId> {
+    match delegation {
+        OpenDelegation::Read(delegation) => Some(delegation.stateid),
+        OpenDelegation::Write(delegation) => Some(delegation.stateid),
+        OpenDelegation::None | OpenDelegation::NoneExt(_) => None,
+    }
+}
+
+pub(crate) fn open_cleanup_error(error: Error, close_result: Result<()>) -> Error {
+    cleanup_error(
+        error,
+        "cleanup CLOSE after failed OPEN post-processing",
+        close_result,
+    )
+}
+
+pub(crate) fn cleanup_error(
+    error: Error,
+    cleanup_context: &'static str,
+    cleanup_result: Result<()>,
+) -> Error {
+    match cleanup_result {
+        Ok(()) => error,
+        Err(cleanup_error) => Error::cleanup(cleanup_context, error, cleanup_error),
+    }
+}
+
+pub(crate) fn ensure_distinct_copy_handles(source: &FileHandle, target: &FileHandle) -> Result<()> {
+    if source == target {
+        return Err(Error::Protocol(
+            "copy source and destination refer to the same file handle".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn response_getfh(response: &CompoundResponse) -> Result<FileHandle> {
     response
         .results
@@ -471,14 +613,18 @@ pub(crate) fn response_access(response: &CompoundResponse) -> Result<AccessResul
         .ok_or_else(|| Error::Protocol("COMPOUND did not include ACCESS result".into()))?
 }
 
-pub(crate) fn response_read(response: &CompoundResponse) -> Result<(bool, Vec<u8>)> {
+pub(crate) fn response_read(
+    response: &CompoundResponse,
+    requested_count: u32,
+) -> Result<(bool, Vec<u8>)> {
     response
         .results
         .iter()
         .find_map(|result| match result {
-            OperationResult::Read { status, eof, data } if status.is_ok() => {
-                Some(Ok((*eof, data.clone())))
-            }
+            OperationResult::Read { status, eof, data } if status.is_ok() => Some(
+                validate_read_result_size(requested_count, data.len(), *eof)
+                    .map(|()| (*eof, data.clone())),
+            ),
             OperationResult::Read { status, .. } => Some(Err(Error::nfsv4("READ", *status))),
             _ => None,
         })
@@ -502,7 +648,10 @@ pub(crate) fn response_readlink(response: &CompoundResponse) -> Result<String> {
         .ok_or_else(|| Error::Protocol("COMPOUND did not include READLINK result".into()))?
 }
 
-pub(crate) fn response_write(response: &CompoundResponse) -> Result<WriteResult> {
+pub(crate) fn response_write(
+    response: &CompoundResponse,
+    requested_count: u32,
+) -> Result<WriteResult> {
     response
         .results
         .iter()
@@ -510,11 +659,43 @@ pub(crate) fn response_write(response: &CompoundResponse) -> Result<WriteResult>
             OperationResult::Write {
                 status,
                 result: Some(write),
-            } if status.is_ok() => Some(Ok(write.clone())),
+            } if status.is_ok() => Some(
+                validate_write_result_count(requested_count, write.count).map(|()| write.clone()),
+            ),
             OperationResult::Write { status, .. } => Some(Err(Error::nfsv4("WRITE", *status))),
             _ => None,
         })
         .ok_or_else(|| Error::Protocol("COMPOUND did not include WRITE result".into()))?
+}
+
+pub(crate) fn validate_read_result_size(
+    requested_count: u32,
+    data_len: usize,
+    eof: bool,
+) -> Result<()> {
+    if data_len > requested_count as usize {
+        return Err(Error::Protocol(format!(
+            "NFSv4 READ returned {data_len} bytes for a {requested_count} byte request"
+        )));
+    }
+    if requested_count > 0 && data_len == 0 && !eof {
+        return Err(Error::Protocol(
+            "NFSv4 READ returned no data before EOF".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_write_result_count(requested_count: u32, returned_count: u32) -> Result<()> {
+    if returned_count > requested_count {
+        return Err(Error::Protocol(format!(
+            "NFSv4 WRITE reported {returned_count} bytes for a {requested_count} byte request"
+        )));
+    }
+    if requested_count > 0 && returned_count == 0 {
+        return Err(Error::Protocol("NFSv4 WRITE accepted zero bytes".into()));
+    }
+    Ok(())
 }
 
 pub(crate) fn response_commit(response: &CompoundResponse) -> Result<CommitResult> {
@@ -570,6 +751,7 @@ pub(crate) fn dir_page_from_entries(
     cookieverf: Verifier,
     entries: Vec<crate::v4::proto::DirEntry>,
     eof: bool,
+    previous_cookie: u64,
     max_entries: usize,
 ) -> Result<DirPage> {
     if entries.len() > max_entries {
@@ -577,17 +759,7 @@ pub(crate) fn dir_page_from_entries(
             "NFSv4 READDIR exceeded configured limit of {max_entries} entries"
         )));
     }
-    let next_cursor = if eof {
-        None
-    } else {
-        let last = entries.last().ok_or_else(|| {
-            Error::Protocol("NFSv4 READDIR returned no entries before EOF".into())
-        })?;
-        Some(DirPageCursor {
-            cookie: last.cookie,
-            cookieverf,
-        })
-    };
+    let next_cursor = next_dir_cursor(cookieverf, &entries, eof, previous_cookie)?;
     let entries = entries
         .into_iter()
         .map(DirEntry::from_wire)
@@ -596,6 +768,30 @@ pub(crate) fn dir_page_from_entries(
         entries,
         next_cursor,
     })
+}
+
+pub(crate) fn next_dir_cursor(
+    cookieverf: Verifier,
+    entries: &[crate::v4::proto::DirEntry],
+    eof: bool,
+    previous_cookie: u64,
+) -> Result<Option<DirPageCursor>> {
+    if eof {
+        return Ok(None);
+    }
+
+    let last = entries
+        .last()
+        .ok_or_else(|| Error::Protocol("NFSv4 READDIR returned no entries before EOF".into()))?;
+    if last.cookie == previous_cookie {
+        return Err(Error::Protocol(format!(
+            "NFSv4 READDIR did not advance directory cookie {previous_cookie}"
+        )));
+    }
+    Ok(Some(DirPageCursor {
+        cookie: last.cookie,
+        cookieverf,
+    }))
 }
 
 pub(crate) fn verifier_from_time() -> Verifier {
@@ -657,6 +853,7 @@ mod tests {
                 attrs: Fattr::empty(),
             }],
             false,
+            0,
             16,
         )
         .unwrap();
@@ -669,6 +866,24 @@ mod tests {
                 cookieverf: [8; NFS4_VERIFIER_SIZE],
             })
         );
+    }
+
+    #[test]
+    fn rejects_non_advancing_directory_cookies() {
+        assert!(matches!(
+            dir_page_from_entries(
+                [8; NFS4_VERIFIER_SIZE],
+                vec![crate::v4::proto::DirEntry {
+                    cookie: 11,
+                    name: "file".to_owned(),
+                    attrs: Fattr::empty(),
+                }],
+                false,
+                11,
+                16,
+            ),
+            Err(Error::Protocol(_))
+        ));
     }
 
     #[test]
@@ -725,8 +940,9 @@ mod tests {
 
     #[test]
     fn derives_payload_limit_from_session_channel_size() {
-        assert_eq!(session_payload_limit(0), 1);
-        assert_eq!(session_payload_limit(4096), 1);
+        assert_eq!(session_payload_limit(0), 0);
+        assert_eq!(session_payload_limit(4096), 0);
+        assert_eq!(session_payload_limit(4097), 1);
         assert_eq!(session_payload_limit(8192), 4096);
         assert_eq!(session_payload_limit(u32::MAX), NFS4_MAX_IO as u32);
     }
@@ -832,12 +1048,257 @@ mod tests {
     }
 
     #[test]
+    fn rejects_session_channels_without_payload_capacity() {
+        let mut attrs = ChannelAttrs::fore_channel_default();
+        assert!(validate_session_channel_attrs(&attrs).is_ok());
+
+        attrs.max_request_size = 4096;
+        assert!(matches!(
+            validate_session_channel_attrs(&attrs),
+            Err(Error::Protocol(_))
+        ));
+
+        attrs.max_request_size = ChannelAttrs::fore_channel_default().max_request_size;
+        attrs.max_response_size = 0;
+        assert!(matches!(
+            validate_session_channel_attrs(&attrs),
+            Err(Error::Protocol(_))
+        ));
+
+        attrs.max_response_size = ChannelAttrs::fore_channel_default().max_response_size;
+        attrs.max_requests = 0;
+        assert!(matches!(
+            validate_session_channel_attrs(&attrs),
+            Err(Error::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_copy_between_equal_file_handles() {
+        let handle = FileHandle::new(vec![1, 2, 3]).unwrap();
+        assert!(matches!(
+            ensure_distinct_copy_handles(&handle, &handle),
+            Err(Error::Protocol(_))
+        ));
+
+        let other = FileHandle::new(vec![1, 2, 4]).unwrap();
+        assert!(ensure_distinct_copy_handles(&handle, &other).is_ok());
+    }
+
+    #[test]
+    fn finish_with_close_preserves_cleanup_failures() {
+        let err = finish_with_close::<()>(
+            Err(Error::Protocol("primary failure".to_owned())),
+            Err(Error::Protocol("close failure".to_owned())),
+        )
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("primary failure"));
+        assert!(message.contains("close failure"));
+    }
+
+    #[test]
+    fn validates_compound_response_shape_and_order() {
+        let ok = CompoundResponse {
+            status: Status::Ok,
+            tag: String::new(),
+            results: vec![
+                OperationResult::Sequence {
+                    status: Status::Ok,
+                    result: None,
+                },
+                OperationResult::StatusOnly {
+                    op: OpCode::PutFh,
+                    status: Status::Ok,
+                },
+                OperationResult::Read {
+                    status: Status::Ok,
+                    eof: true,
+                    data: Vec::new(),
+                },
+            ],
+        };
+        assert!(
+            validate_compound_response_shape(
+                "read",
+                &[OpCode::Sequence, OpCode::PutFh, OpCode::Read],
+                &ok
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            validate_compound_response_shape(
+                "read",
+                &[OpCode::Sequence, OpCode::GetFh, OpCode::Read],
+                &ok
+            ),
+            Err(Error::Protocol(_))
+        ));
+
+        let too_many = CompoundResponse {
+            status: Status::Ok,
+            tag: String::new(),
+            results: vec![
+                OperationResult::StatusOnly {
+                    op: OpCode::PutRootFh,
+                    status: Status::Ok,
+                },
+                OperationResult::StatusOnly {
+                    op: OpCode::GetFh,
+                    status: Status::Ok,
+                },
+            ],
+        };
+        assert!(matches!(
+            validate_compound_response_shape("getfh", &[OpCode::PutRootFh], &too_many),
+            Err(Error::Protocol(_))
+        ));
+
+        let short_success = CompoundResponse {
+            status: Status::Ok,
+            tag: String::new(),
+            results: vec![OperationResult::StatusOnly {
+                op: OpCode::PutRootFh,
+                status: Status::Ok,
+            }],
+        };
+        assert!(matches!(
+            validate_compound_response_shape(
+                "getattr",
+                &[OpCode::PutRootFh, OpCode::GetAttr],
+                &short_success
+            ),
+            Err(Error::Protocol(_))
+        ));
+
+        let failed_lookup = CompoundResponse {
+            status: Status::NoEnt,
+            tag: String::new(),
+            results: vec![
+                OperationResult::Sequence {
+                    status: Status::Ok,
+                    result: None,
+                },
+                OperationResult::StatusOnly {
+                    op: OpCode::Lookup,
+                    status: Status::NoEnt,
+                },
+            ],
+        };
+        assert!(
+            validate_compound_response_shape(
+                "lookup",
+                &[OpCode::Sequence, OpCode::Lookup, OpCode::GetAttr],
+                &failed_lookup
+            )
+            .is_ok()
+        );
+
+        let failed_with_ok_results = CompoundResponse {
+            status: Status::NoEnt,
+            tag: String::new(),
+            results: vec![OperationResult::StatusOnly {
+                op: OpCode::Lookup,
+                status: Status::Ok,
+            }],
+        };
+        assert!(matches!(
+            validate_compound_response_shape("lookup", &[OpCode::Lookup], &failed_with_ok_results),
+            Err(Error::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn accepts_spec_illegal_result_for_unsupported_operation() {
+        let response = CompoundResponse {
+            status: Status::OpIllegal,
+            tag: String::new(),
+            results: vec![
+                OperationResult::Sequence {
+                    status: Status::Ok,
+                    result: None,
+                },
+                OperationResult::StatusOnly {
+                    op: OpCode::Illegal,
+                    status: Status::OpIllegal,
+                },
+            ],
+        };
+
+        assert!(
+            validate_compound_response_shape(
+                "unsupported",
+                &[OpCode::Sequence, OpCode::Seek],
+                &response
+            )
+            .is_ok()
+        );
+
+        let response = CompoundResponse {
+            status: Status::BadXdr,
+            tag: String::new(),
+            results: vec![OperationResult::StatusOnly {
+                op: OpCode::Illegal,
+                status: Status::BadXdr,
+            }],
+        };
+        assert!(matches!(
+            validate_compound_response_shape("bad", &[OpCode::Seek], &response),
+            Err(Error::Protocol(_))
+        ));
+    }
+
+    #[test]
     fn validates_session_compound_operation_count_with_sequence() {
         assert!(validate_session_compound_operation_count(3, 4).is_ok());
         assert!(matches!(
             validate_session_compound_operation_count(4, 4),
             Err(Error::Protocol(_))
         ));
+    }
+
+    #[test]
+    fn rejects_open_confirm_for_session_minor_versions() {
+        let open = OpenResult {
+            stateid: StateId::anonymous(),
+            result_flags: OPEN4_RESULT_CONFIRM,
+            attrset: Bitmap::empty(),
+            delegation: OpenDelegation::None,
+        };
+
+        assert!(matches!(
+            validate_open_result(&open, NFS4_MINOR_VERSION_SESSION_MIN),
+            Err(Error::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn detects_open_delegation_stateid_for_return() {
+        let delegated = StateId {
+            seqid: 7,
+            other: [8; 12],
+        };
+        let open = OpenResult {
+            stateid: StateId::anonymous(),
+            result_flags: 0,
+            attrset: Bitmap::empty(),
+            delegation: OpenDelegation::Read(OpenReadDelegation {
+                stateid: delegated,
+                recall: false,
+                permissions: NfsAce {
+                    ace_type: 0,
+                    flag: 0,
+                    access_mask: ACCESS4_READ,
+                    who: "OWNER@".to_owned(),
+                },
+            }),
+        };
+
+        assert_eq!(
+            validate_open_result(&open, NFS4_MINOR_VERSION_SESSION_MIN).unwrap(),
+            Some(delegated)
+        );
     }
 
     #[test]
@@ -954,6 +1415,66 @@ mod tests {
     }
 
     #[test]
+    fn response_read_validates_returned_size_and_progress() {
+        let oversized = CompoundResponse {
+            status: Status::Ok,
+            tag: String::new(),
+            results: vec![OperationResult::Read {
+                status: Status::Ok,
+                eof: false,
+                data: vec![1, 2, 3, 4, 5],
+            }],
+        };
+        assert!(matches!(
+            response_read(&oversized, 4),
+            Err(Error::Protocol(_))
+        ));
+
+        let no_progress = CompoundResponse {
+            status: Status::Ok,
+            tag: String::new(),
+            results: vec![OperationResult::Read {
+                status: Status::Ok,
+                eof: false,
+                data: Vec::new(),
+            }],
+        };
+        assert!(matches!(
+            response_read(&no_progress, 4),
+            Err(Error::Protocol(_))
+        ));
+
+        let eof = CompoundResponse {
+            status: Status::Ok,
+            tag: String::new(),
+            results: vec![OperationResult::Read {
+                status: Status::Ok,
+                eof: true,
+                data: Vec::new(),
+            }],
+        };
+        assert_eq!(response_read(&eof, 4).unwrap(), (true, Vec::new()));
+    }
+
+    #[test]
+    fn response_write_validates_returned_count() {
+        let no_progress = write_response_with_count(0);
+        assert!(matches!(
+            response_write(&no_progress, 4),
+            Err(Error::Protocol(_))
+        ));
+
+        let oversized = write_response_with_count(5);
+        assert!(matches!(
+            response_write(&oversized, 4),
+            Err(Error::Protocol(_))
+        ));
+
+        let ok = response_write(&write_response_with_count(4), 4).unwrap();
+        assert_eq!(ok.count, 4);
+    }
+
+    #[test]
     fn advance_offset_rejects_overflow() {
         let mut offset = u64::MAX;
         assert!(matches!(
@@ -961,5 +1482,20 @@ mod tests {
             Err(Error::Protocol(_))
         ));
         assert_eq!(offset, u64::MAX);
+    }
+
+    fn write_response_with_count(count: u32) -> CompoundResponse {
+        CompoundResponse {
+            status: Status::Ok,
+            tag: String::new(),
+            results: vec![OperationResult::Write {
+                status: Status::Ok,
+                result: Some(WriteResult {
+                    count,
+                    committed: StableHow::FileSync,
+                    verifier: [0; NFS4_VERIFIER_SIZE],
+                }),
+            }],
+        }
     }
 }

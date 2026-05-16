@@ -6,7 +6,7 @@ use ::tokio::net::{TcpStream, ToSocketAddrs};
 use crate::error::{Error, Result};
 use crate::rpc::{
     Auth, DEFAULT_MAX_RECORD_SIZE, FRAGMENT_LEN_MASK, LAST_FRAGMENT, decode_reply, default_stamp,
-    encode_call,
+    encode_call, validate_max_record_size,
 };
 use crate::xdr::Encode;
 
@@ -40,8 +40,10 @@ impl RpcClient {
         self.timeout = timeout;
     }
 
-    pub(crate) fn set_max_record_size(&mut self, max_record_size: usize) {
+    pub(crate) fn set_max_record_size(&mut self, max_record_size: usize) -> Result<()> {
+        validate_max_record_size(max_record_size)?;
         self.max_record_size = max_record_size;
+        Ok(())
     }
 
     pub(crate) async fn call<T: Encode + ?Sized>(
@@ -92,16 +94,29 @@ impl RpcClient {
             let header = u32::from_be_bytes(header_bytes);
             let is_last = (header & LAST_FRAGMENT) != 0;
             let fragment_len = (header & FRAGMENT_LEN_MASK) as usize;
+            if fragment_len == 0 && !is_last {
+                return Err(Error::Protocol(
+                    "RPC record contained zero-length non-final fragment".to_owned(),
+                ));
+            }
 
-            if record.len().saturating_add(fragment_len) > self.max_record_size {
+            let next_len =
+                record
+                    .len()
+                    .checked_add(fragment_len)
+                    .ok_or(Error::RpcRecordTooLarge {
+                        len: usize::MAX,
+                        max: self.max_record_size,
+                    })?;
+            if next_len > self.max_record_size {
                 return Err(Error::RpcRecordTooLarge {
-                    len: record.len().saturating_add(fragment_len),
+                    len: next_len,
                     max: self.max_record_size,
                 });
             }
 
             let start = record.len();
-            record.resize(start + fragment_len, 0);
+            record.resize(next_len, 0);
             read_exact(&mut self.stream, &mut record[start..], self.timeout).await?;
 
             if is_last {
@@ -167,4 +182,32 @@ fn timeout_error() -> Error {
         std::io::ErrorKind::TimedOut,
         "NFS async operation timed out",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ::tokio::io::AsyncWriteExt;
+    use ::tokio::net::TcpListener;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejects_zero_length_nonfinal_record_fragments() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(&0_u32.to_be_bytes()).await.unwrap();
+        });
+
+        let mut client =
+            RpcClient::connect_with_timeout(addr, Auth::none(), Some(Duration::from_secs(1)))
+                .await
+                .unwrap();
+        let err = client.read_record().await.unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Protocol(message) if message.contains("zero-length non-final")
+        ));
+        accept.await.unwrap();
+    }
 }

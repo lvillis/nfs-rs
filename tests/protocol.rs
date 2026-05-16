@@ -155,6 +155,17 @@ fn classifies_operational_error_semantics() {
         }
         .is_read_only()
     );
+
+    let cleanup = Error::Cleanup {
+        context: "cleanup CLOSE",
+        primary: Box::new(Error::Nfs {
+            procedure: "WRITE",
+            status: NfsStatus::Dquot,
+        }),
+        cleanup: Box::new(Error::Protocol("cleanup failed".to_owned())),
+    };
+    assert!(cleanup.is_no_space());
+    assert!(cleanup.to_string().contains("cleanup failed"));
 }
 
 #[test]

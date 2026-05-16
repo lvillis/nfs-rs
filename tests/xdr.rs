@@ -112,10 +112,12 @@ fn rejects_lengths_above_declared_limit() {
 }
 
 #[test]
-fn ignores_non_zero_padding_from_remote_peers() {
+fn rejects_non_zero_padding_from_remote_peers() {
     let mut decoder = Decoder::new(&[0, 0, 0, 1, b'a', 0, 7, 0]);
-    assert_eq!(decoder.read_opaque(8).unwrap(), b"a");
-    assert!(decoder.finish().is_ok());
+    assert_eq!(
+        decoder.read_opaque(8).unwrap_err(),
+        Error::InvalidPadding { value: 7 }
+    );
 }
 
 #[test]
@@ -159,6 +161,17 @@ fn encodes_and_decodes_arrays() {
 
     let mut decoder = Decoder::new(encoder.as_slice());
     assert_eq!(decoder.read_array::<u32>(4).unwrap(), vec![1, 2, 3]);
+    assert!(decoder.finish().is_ok());
+}
+
+#[test]
+fn decodes_arrays_larger_than_initial_preallocation() {
+    let values = (0..1500_u32).collect::<Vec<_>>();
+    let mut encoder = Encoder::new();
+    encoder.write_array(&values, values.len()).unwrap();
+
+    let mut decoder = Decoder::new(encoder.as_slice());
+    assert_eq!(decoder.read_array::<u32>(values.len()).unwrap(), values);
     assert!(decoder.finish().is_ok());
 }
 

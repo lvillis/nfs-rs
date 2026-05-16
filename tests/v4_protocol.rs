@@ -4,6 +4,10 @@ use nfs::Error;
 use nfs::v4::protocol::*;
 use nfs::xdr::{Decode, Decoder, Encode, Encoder, to_bytes};
 
+fn bitmap(attrs: &[u32]) -> Bitmap {
+    Bitmap::from_attrs(attrs).unwrap()
+}
+
 #[test]
 fn encodes_compound_with_v42_minor_version() {
     let args = CompoundArgs {
@@ -50,12 +54,44 @@ fn decodes_getfh_compound_response() {
 }
 
 #[test]
+fn rejects_oversized_exchange_id_state_protect_handles() {
+    let mut wire = Encoder::new();
+    wire.write_u32(Status::Ok.as_u32());
+    wire.write_string("t", 1024).unwrap();
+    wire.write_u32(1); // result count
+
+    wire.write_u32(OpCode::ExchangeId.as_u32());
+    wire.write_u32(Status::Ok.as_u32());
+    wire.write_u64(1); // clientid
+    wire.write_u32(1); // sequence id
+    wire.write_u32(0); // flags
+    wire.write_u32(StateProtectHow::SecretStateVerifier.as_u32());
+    Bitmap::empty().encode(&mut wire).unwrap(); // must enforce
+    Bitmap::empty().encode(&mut wire).unwrap(); // must allow
+    wire.write_u32(0); // hash alg
+    wire.write_u32(0); // encrypt alg
+    wire.write_u32(0); // ssv length
+    wire.write_u32(0); // window
+    wire.write_u32(1025); // handles
+
+    let bytes = wire.into_bytes();
+    let mut decoder = Decoder::new(&bytes);
+    assert!(matches!(
+        CompoundResponse::decode(&mut decoder),
+        Err(nfs::xdr::Error::LengthLimitExceeded {
+            len: 1025,
+            max: 1024
+        })
+    ));
+}
+
+#[test]
 fn decodes_readdir_entries_with_basic_attributes() {
     let mut attr_vals = Encoder::new();
     attr_vals.write_u32(1); // NF4REG
     attr_vals.write_u64(512);
     let attrs = Fattr {
-        attrmask: Bitmap::from_attrs(&[FATTR4_TYPE, FATTR4_SIZE]),
+        attrmask: bitmap(&[FATTR4_TYPE, FATTR4_SIZE]),
         attr_vals: attr_vals.into_bytes(),
     };
 
@@ -99,7 +135,7 @@ fn decodes_readdir_entries_with_basic_attributes() {
 
 #[test]
 fn builds_and_queries_v4_bitmaps() {
-    let bitmap = Bitmap::from_attrs(FATTR4_BASIC_ATTRS);
+    let bitmap = bitmap(FATTR4_BASIC_ATTRS);
     assert!(bitmap.contains(FATTR4_TYPE));
     assert!(bitmap.contains(FATTR4_CHANGE));
     assert!(bitmap.contains(FATTR4_SIZE));
@@ -116,22 +152,38 @@ fn builds_and_queries_v4_bitmaps() {
 }
 
 #[test]
+fn rejects_oversized_v4_bitmap_construction() {
+    assert!(matches!(
+        Bitmap::from_attrs(&[u32::MAX]),
+        Err(Error::Protocol(_))
+    ));
+    assert!(matches!(
+        Bitmap::from_supported_attrs(&Bitmap::empty(), &[u32::MAX]),
+        Err(Error::Protocol(_))
+    ));
+}
+
+#[test]
 fn filters_v4_attr_requests_by_supported_attrs() {
-    let supported = Bitmap::from_attrs(&[FATTR4_TYPE, FATTR4_SIZE, FATTR4_SPACE_TOTAL]);
-    let request = Bitmap::from_supported_attrs(&supported, FATTR4_BASIC_ATTRS);
+    let supported = bitmap(&[FATTR4_TYPE, FATTR4_SIZE, FATTR4_SPACE_TOTAL]);
+    let request = Bitmap::from_supported_attrs(&supported, FATTR4_BASIC_ATTRS).unwrap();
 
     assert!(!request.is_empty());
     assert!(request.contains(FATTR4_TYPE));
     assert!(request.contains(FATTR4_SIZE));
     assert!(!request.contains(FATTR4_MODE));
-    assert!(Bitmap::from_supported_attrs(&Bitmap::empty(), FATTR4_BASIC_ATTRS).is_empty());
+    assert!(
+        Bitmap::from_supported_attrs(&Bitmap::empty(), FATTR4_BASIC_ATTRS)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
 fn parses_v4_supported_attrs_attribute() {
-    let supported = Bitmap::from_attrs(&[FATTR4_TYPE, FATTR4_SIZE, FATTR4_MODE]);
+    let supported = bitmap(&[FATTR4_TYPE, FATTR4_SIZE, FATTR4_MODE]);
     let attrs = Fattr {
-        attrmask: Bitmap::from_attrs(&[FATTR4_SUPPORTED_ATTRS]),
+        attrmask: bitmap(&[FATTR4_SUPPORTED_ATTRS]),
         attr_vals: to_bytes(&supported).unwrap(),
     };
     let parsed = attrs.parse_supported_attrs().unwrap();
@@ -162,7 +214,7 @@ fn parses_basic_v4_attributes() {
     attr_vals.write_u32(15);
 
     let attrs = Fattr {
-        attrmask: Bitmap::from_attrs(FATTR4_BASIC_ATTRS),
+        attrmask: bitmap(FATTR4_BASIC_ATTRS),
         attr_vals: attr_vals.into_bytes(),
     };
     let parsed = attrs.parse_basic().unwrap();
@@ -262,7 +314,7 @@ fn builds_v4_setattr_payloads() {
 
 #[test]
 fn parses_v4_fsstat_attributes() {
-    let bitmap = Bitmap::from_attrs(FATTR4_FSSTAT_ATTRS);
+    let bitmap = bitmap(FATTR4_FSSTAT_ATTRS);
     assert!(bitmap.contains(FATTR4_FILES_AVAIL));
     assert!(bitmap.contains(FATTR4_FILES_FREE));
     assert!(bitmap.contains(FATTR4_FILES_TOTAL));
@@ -294,7 +346,7 @@ fn parses_v4_fsstat_attributes() {
 
 #[test]
 fn parses_v4_fsinfo_attributes() {
-    let bitmap = Bitmap::from_attrs(FATTR4_FSINFO_ATTRS);
+    let bitmap = bitmap(FATTR4_FSINFO_ATTRS);
     assert!(bitmap.contains(FATTR4_FH_EXPIRE_TYPE));
     assert!(bitmap.contains(FATTR4_LINK_SUPPORT));
     assert!(bitmap.contains(FATTR4_SYMLINK_SUPPORT));
@@ -347,7 +399,7 @@ fn parses_v4_fsinfo_attributes() {
 
 #[test]
 fn parses_v4_pathconf_attributes() {
-    let bitmap = Bitmap::from_attrs(FATTR4_PATHCONF_ATTRS);
+    let bitmap = bitmap(FATTR4_PATHCONF_ATTRS);
     assert!(bitmap.contains(FATTR4_CASE_INSENSITIVE));
     assert!(bitmap.contains(FATTR4_CASE_PRESERVING));
     assert!(bitmap.contains(FATTR4_CHOWN_RESTRICTED));
@@ -600,7 +652,7 @@ fn encodes_v40_v41_pnfs_delegation_and_ssv_operations() {
 
     let get_dir_delegation = to_bytes(&Operation::GetDirDelegation(GetDirDelegationArgs {
         signal_deleg_avail: true,
-        notification_types: Bitmap::from_attrs(&[1, 33]),
+        notification_types: bitmap(&[1, 33]),
         child_attr_delay: NfsTime {
             seconds: 1,
             nseconds: 2,
@@ -609,14 +661,14 @@ fn encodes_v40_v41_pnfs_delegation_and_ssv_operations() {
             seconds: 3,
             nseconds: 4,
         },
-        child_attributes: Bitmap::from_attrs(&[FATTR4_SIZE]),
-        dir_attributes: Bitmap::from_attrs(&[FATTR4_CHANGE]),
+        child_attributes: bitmap(&[FATTR4_SIZE]),
+        dir_attributes: bitmap(&[FATTR4_CHANGE]),
     }))
     .unwrap();
     let mut expected = Encoder::new();
     expected.write_u32(46); // OP_GET_DIR_DELEGATION
     expected.write_bool(true);
-    Bitmap::from_attrs(&[1, 33]).encode(&mut expected).unwrap();
+    bitmap(&[1, 33]).encode(&mut expected).unwrap();
     NfsTime {
         seconds: 1,
         nseconds: 2,
@@ -629,19 +681,15 @@ fn encodes_v40_v41_pnfs_delegation_and_ssv_operations() {
     }
     .encode(&mut expected)
     .unwrap();
-    Bitmap::from_attrs(&[FATTR4_SIZE])
-        .encode(&mut expected)
-        .unwrap();
-    Bitmap::from_attrs(&[FATTR4_CHANGE])
-        .encode(&mut expected)
-        .unwrap();
+    bitmap(&[FATTR4_SIZE]).encode(&mut expected).unwrap();
+    bitmap(&[FATTR4_CHANGE]).encode(&mut expected).unwrap();
     assert_eq!(get_dir_delegation, expected.into_bytes());
 
     let get_device_info = to_bytes(&Operation::GetDeviceInfo(GetDeviceInfoArgs {
         device_id,
         layout_type: LayoutType::NfsV4_1Files,
         max_count: 4096,
-        notify_types: Bitmap::from_attrs(&[0]),
+        notify_types: bitmap(&[0]),
     }))
     .unwrap();
     let mut expected = Encoder::new();
@@ -649,7 +697,7 @@ fn encodes_v40_v41_pnfs_delegation_and_ssv_operations() {
     expected.write_fixed_opaque(&device_id);
     expected.write_u32(LAYOUT4_NFSV4_1_FILES);
     expected.write_u32(4096);
-    Bitmap::from_attrs(&[0]).encode(&mut expected).unwrap();
+    bitmap(&[0]).encode(&mut expected).unwrap();
     assert_eq!(get_device_info, expected.into_bytes());
 
     let get_device_list = to_bytes(&Operation::GetDeviceList(GetDeviceListArgs {
@@ -890,7 +938,7 @@ fn encodes_v42_data_range_operations() {
         stateid,
         offset: 0x0102_0304_0506_0708,
         count: 0x1112_1314_1516_1718,
-        hints: Bitmap::from_attrs(&[
+        hints: bitmap(&[
             IoAdviceType::Sequential.as_u32(),
             IoAdviceType::WillNeed.as_u32(),
         ]),
@@ -1547,7 +1595,7 @@ fn decodes_v42_data_range_results() {
 
     wire.write_u32(63); // OP_IO_ADVISE
     wire.write_u32(0); // status
-    Bitmap::from_attrs(&[IoAdviceType::Sequential.as_u32()])
+    bitmap(&[IoAdviceType::Sequential.as_u32()])
         .encode(&mut wire)
         .unwrap();
 
@@ -1799,19 +1847,15 @@ fn decodes_v40_v41_pnfs_delegation_and_ssv_results() {
     wire.write_u32(GDD4_OK);
     wire.write_fixed_opaque(&[2; 8]);
     stateid.encode(&mut wire).unwrap();
-    Bitmap::from_attrs(&[1]).encode(&mut wire).unwrap();
-    Bitmap::from_attrs(&[FATTR4_SIZE])
-        .encode(&mut wire)
-        .unwrap();
-    Bitmap::from_attrs(&[FATTR4_CHANGE])
-        .encode(&mut wire)
-        .unwrap();
+    bitmap(&[1]).encode(&mut wire).unwrap();
+    bitmap(&[FATTR4_SIZE]).encode(&mut wire).unwrap();
+    bitmap(&[FATTR4_CHANGE]).encode(&mut wire).unwrap();
 
     wire.write_u32(47); // OP_GETDEVICEINFO
     wire.write_u32(0); // status
     wire.write_u32(LAYOUT4_NFSV4_1_FILES);
     wire.write_opaque(b"addr", 64 * 1024 * 1024).unwrap();
-    Bitmap::from_attrs(&[0]).encode(&mut wire).unwrap();
+    bitmap(&[0]).encode(&mut wire).unwrap();
 
     wire.write_u32(47); // OP_GETDEVICEINFO
     wire.write_u32(Status::TooSmall.as_u32());

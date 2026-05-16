@@ -35,6 +35,8 @@ pub const NFS4_MAXFILEOFF: u64 = 0xffff_ffff_ffff_fffe;
 pub const NFS4_NSECONDS_PER_SECOND: u32 = 1_000_000_000;
 
 const DEFAULT_SESSION_CHANNEL_SIZE: u32 = 1024 * 1024;
+const NFS4_MAX_BITMAP_WORDS: usize = 128;
+const NFS4_MAX_STATE_PROTECT_HANDLES: usize = 1024;
 
 pub const FATTR4_SUPPORTED_ATTRS: u32 = 0;
 pub const FATTR4_TYPE: u32 = 1;
@@ -1033,7 +1035,21 @@ impl Bitmap {
     }
 
     /// Builds a bitmap containing the given attribute numbers.
-    pub fn from_attrs(attrs: &[u32]) -> Self {
+    ///
+    /// The client caps bitmap construction to the same word count accepted by
+    /// the decoder, preventing accidental huge allocations from untrusted attr
+    /// ids.
+    pub fn from_attrs(attrs: &[u32]) -> Result<Self> {
+        validate_bitmap_attrs(attrs)?;
+        Ok(Self::from_valid_attrs(attrs))
+    }
+
+    pub(crate) fn from_known_attrs(attrs: &[u32]) -> Self {
+        debug_assert!(validate_bitmap_attrs(attrs).is_ok());
+        Self::from_valid_attrs(attrs)
+    }
+
+    fn from_valid_attrs(attrs: &[u32]) -> Self {
         let max = attrs.iter().copied().max();
         let mut words = max
             .map(|attr| vec![0; attr as usize / 32 + 1])
@@ -1047,7 +1063,8 @@ impl Bitmap {
     }
 
     /// Builds a bitmap containing requested attributes that are supported.
-    pub fn from_supported_attrs(supported: &Self, attrs: &[u32]) -> Self {
+    pub fn from_supported_attrs(supported: &Self, attrs: &[u32]) -> Result<Self> {
+        validate_bitmap_attrs(attrs)?;
         let attrs = attrs
             .iter()
             .copied()
@@ -1094,16 +1111,30 @@ impl Bitmap {
 
 impl Encode for Bitmap {
     fn encode(&self, encoder: &mut Encoder) -> crate::xdr::Result<()> {
-        encoder.write_array(&self.words, 128)
+        encoder.write_array(&self.words, NFS4_MAX_BITMAP_WORDS)
     }
 }
 
 impl Decode for Bitmap {
     fn decode(decoder: &mut Decoder<'_>) -> crate::xdr::Result<Self> {
         Ok(Self {
-            words: decoder.read_array::<u32>(128)?,
+            words: decoder.read_array::<u32>(NFS4_MAX_BITMAP_WORDS)?,
         })
     }
+}
+
+fn validate_bitmap_attrs(attrs: &[u32]) -> Result<()> {
+    let Some(attr) = attrs
+        .iter()
+        .copied()
+        .find(|attr| (*attr as usize / 32) >= NFS4_MAX_BITMAP_WORDS)
+    else {
+        return Ok(());
+    };
+
+    Err(Error::Protocol(format!(
+        "NFSv4 bitmap attribute {attr} exceeds supported bitmap word limit {NFS4_MAX_BITMAP_WORDS}"
+    )))
 }
 
 /// Raw NFSv4 attribute payload.
@@ -1132,7 +1163,7 @@ impl Fattr {
         let mut encoder = Encoder::new();
         encoder.write_u64(size);
         Self {
-            attrmask: Bitmap::from_attrs(&[FATTR4_SIZE]),
+            attrmask: Bitmap::from_known_attrs(&[FATTR4_SIZE]),
             attr_vals: encoder.into_bytes(),
         }
     }
@@ -1142,7 +1173,7 @@ impl Fattr {
         let mut encoder = Encoder::new();
         encoder.write_u32(mode);
         Self {
-            attrmask: Bitmap::from_attrs(&[FATTR4_MODE]),
+            attrmask: Bitmap::from_known_attrs(&[FATTR4_MODE]),
             attr_vals: encoder.into_bytes(),
         }
     }
@@ -1178,7 +1209,7 @@ impl Fattr {
         }
 
         Ok(Self {
-            attrmask: Bitmap::from_attrs(&attr_ids),
+            attrmask: Bitmap::from_known_attrs(&attr_ids),
             attr_vals: encoder.into_bytes(),
         })
     }
@@ -5150,7 +5181,13 @@ fn skip_state_protect_reply(decoder: &mut Decoder<'_>) -> crate::xdr::Result<()>
             decoder.read_u32()?;
             decoder.read_u32()?;
             let handle_count = decoder.read_u32()? as usize;
-            for _ in 0..handle_count.min(1024) {
+            if handle_count > NFS4_MAX_STATE_PROTECT_HANDLES {
+                return Err(crate::xdr::Error::LengthLimitExceeded {
+                    len: handle_count,
+                    max: NFS4_MAX_STATE_PROTECT_HANDLES,
+                });
+            }
+            for _ in 0..handle_count {
                 decoder.read_opaque(NFS4_OPAQUE_LIMIT)?;
             }
             Ok(())

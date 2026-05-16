@@ -33,6 +33,15 @@ pub enum Error {
     },
     /// Protocol-level invariant violation detected by the client.
     Protocol(String),
+    /// Primary operation failed and a best-effort cleanup operation also failed.
+    Cleanup {
+        /// Cleanup step that failed.
+        context: &'static str,
+        /// Primary operation error.
+        primary: Box<Error>,
+        /// Cleanup operation error.
+        cleanup: Box<Error>,
+    },
     /// RPC reply XID did not match the request XID.
     RpcMismatch {
         /// Request XID.
@@ -105,9 +114,18 @@ impl Error {
         Self::NfsV4 { operation, status }
     }
 
+    pub(crate) fn cleanup(context: &'static str, primary: Error, cleanup: Error) -> Self {
+        Self::Cleanup {
+            context,
+            primary: Box::new(primary),
+            cleanup: Box::new(cleanup),
+        }
+    }
+
     /// Returns true for missing paths across local I/O, NFSv3, and NFSv4.
     pub fn is_not_found(&self) -> bool {
         match self {
+            Self::Cleanup { primary, .. } => primary.is_not_found(),
             Self::Io(err) => err.kind() == std::io::ErrorKind::NotFound,
             Self::Mount {
                 status: crate::v3::MountStatus::NoEnt,
@@ -127,6 +145,7 @@ impl Error {
     /// Returns true for permission errors across MOUNT, NFSv3, and NFSv4.
     pub fn is_permission_denied(&self) -> bool {
         match self {
+            Self::Cleanup { primary, .. } => primary.is_permission_denied(),
             Self::Io(err) => err.kind() == std::io::ErrorKind::PermissionDenied,
             Self::Mount {
                 status: crate::v3::MountStatus::Perm | crate::v3::MountStatus::Access,
@@ -155,6 +174,7 @@ impl Error {
     /// NFSv4 clients only when the operation is safe to replay.
     pub fn is_retryable(&self) -> bool {
         match self {
+            Self::Cleanup { primary, .. } => primary.is_retryable(),
             Self::Io(err) => is_retryable_io_error(err.kind()),
             Self::Nfs {
                 status: crate::v3::NfsStatus::Jukebox,
@@ -172,59 +192,70 @@ impl Error {
     /// high-level NFSv4 clients recreate sessions internally and only replay
     /// operations that are safe to send again.
     pub fn requires_session_recovery(&self) -> bool {
-        matches!(
-            self,
-            Self::NfsV4 { status, .. } if status.requires_session_recovery()
-        )
+        match self {
+            Self::Cleanup {
+                primary, cleanup, ..
+            } => primary.requires_session_recovery() || cleanup.requires_session_recovery(),
+            Self::NfsV4 { status, .. } => status.requires_session_recovery(),
+            _ => false,
+        }
     }
 
     /// Returns true for quota or no-space conditions.
     pub fn is_no_space(&self) -> bool {
-        matches!(
-            self,
+        match self {
+            Self::Cleanup { primary, .. } => primary.is_no_space(),
             Self::Nfs {
                 status: crate::v3::NfsStatus::NoSpc | crate::v3::NfsStatus::Dquot,
                 ..
-            } | Self::NfsV4 {
+            }
+            | Self::NfsV4 {
                 status: crate::v4::Status::NoSpc | crate::v4::Status::Dquot,
                 ..
-            }
-        )
+            } => true,
+            _ => false,
+        }
     }
 
     /// Returns true when the server reported a read-only filesystem.
     pub fn is_read_only(&self) -> bool {
-        matches!(
-            self,
+        match self {
+            Self::Cleanup { primary, .. } => primary.is_read_only(),
             Self::Nfs {
                 status: crate::v3::NfsStatus::ReadOnlyFs,
                 ..
-            } | Self::NfsV4 {
+            }
+            | Self::NfsV4 {
                 status: crate::v4::Status::ReadOnlyFs,
                 ..
-            }
-        )
+            } => true,
+            _ => false,
+        }
     }
 
     /// Returns true when a server-side file handle is stale or invalid.
     pub fn is_stale_handle(&self) -> bool {
-        matches!(
-            self,
+        match self {
+            Self::Cleanup { primary, .. } => primary.is_stale_handle(),
             Self::Nfs {
                 status: crate::v3::NfsStatus::Stale | crate::v3::NfsStatus::BadHandle,
                 ..
-            } | Self::NfsV4 {
-                status: crate::v4::Status::Stale
+            }
+            | Self::NfsV4 {
+                status:
+                    crate::v4::Status::Stale
                     | crate::v4::Status::BadHandle
                     | crate::v4::Status::FhExpired,
                 ..
-            }
-        )
+            } => true,
+            _ => false,
+        }
     }
 
     /// Returns true for NFSv4 statuses indicating lost open or lock state.
     pub fn is_lost_state(&self) -> bool {
         match self {
+            Self::Cleanup { primary, .. } => primary.is_lost_state(),
             Self::NfsV4 { status, .. } => status.indicates_lost_state(),
             _ => false,
         }
@@ -233,6 +264,9 @@ impl Error {
     /// Returns true for NFSv4 session errors that can be recovered by reconnecting.
     pub fn is_session_recoverable(&self) -> bool {
         match self {
+            Self::Cleanup {
+                primary, cleanup, ..
+            } => primary.is_session_recoverable() || cleanup.is_session_recoverable(),
             Self::NfsV4 { status, .. } => status.requires_session_recovery(),
             _ => false,
         }
@@ -241,6 +275,7 @@ impl Error {
     /// Returns true when create or rename encountered an existing object.
     pub fn is_already_exists(&self) -> bool {
         match self {
+            Self::Cleanup { primary, .. } => primary.is_already_exists(),
             Self::Io(err) => err.kind() == std::io::ErrorKind::AlreadyExists,
             Self::Nfs {
                 status: crate::v3::NfsStatus::Exist,
@@ -283,6 +318,13 @@ impl fmt::Display for Error {
                 write!(f, "length {len} cannot be represented on the wire")
             }
             Self::Protocol(message) => write!(f, "protocol error: {message}"),
+            Self::Cleanup {
+                context,
+                primary,
+                cleanup,
+            } => {
+                write!(f, "{primary}; {context} also failed: {cleanup}")
+            }
             Self::RpcMismatch { expected, actual } => {
                 write!(f, "RPC xid mismatch: expected {expected}, got {actual}")
             }
@@ -335,6 +377,7 @@ impl std::error::Error for Error {
         match self {
             Self::Io(err) => Some(err),
             Self::Xdr(err) => Some(err),
+            Self::Cleanup { primary, .. } => Some(primary),
             _ => None,
         }
     }

@@ -3,6 +3,10 @@
 use nfs::v4::protocol::*;
 use nfs::xdr::to_bytes;
 
+fn bitmap(attrs: &[u32]) -> Bitmap {
+    Bitmap::from_attrs(attrs).unwrap()
+}
+
 #[test]
 fn rfc7530_8881_7862_program_constants_match_spec() {
     assert_eq!(NFS4_PROGRAM, 100003);
@@ -663,7 +667,7 @@ fn rfc7530_7862_discriminants_match_spec() {
 
 #[test]
 fn rfc8881_bitmap_word_layout_uses_attribute_number_bits() {
-    let bitmap = Bitmap::from_attrs(&[FATTR4_TYPE, FATTR4_MODE, FATTR4_TIME_MODIFY]);
+    let bitmap = bitmap(&[FATTR4_TYPE, FATTR4_MODE, FATTR4_TIME_MODIFY]);
 
     assert_eq!(
         bitmap.words(),
@@ -973,7 +977,7 @@ fn implemented_operation_variants_map_to_spec_opcodes() {
                 stateid,
                 offset: 0,
                 count: 1,
-                hints: Bitmap::from_attrs(&[IoAdviceType::Normal.as_u32()]),
+                hints: bitmap(&[IoAdviceType::Normal.as_u32()]),
             }),
             OpCode::IoAdvise,
         ),

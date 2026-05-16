@@ -19,9 +19,10 @@ use crate::error::{Error, Result};
 use crate::retry::RetryPolicy;
 use crate::rpc::{AuthSys, max_record_size_for_payloads};
 use crate::v3::client::{
-    advance_offset, append_dir_entries, clamp_dir_size, clamp_io_size, dir_page_from_batch,
-    join_path, normalize_path, temporary_sibling_path, validate_max_dir_entries, validate_port,
-    validate_remote_target, validate_transfer_size,
+    advance_offset, append_dir_entries, clamp_dir_size, clamp_io_size, cleanup_error,
+    dir_page_from_batch, ensure_distinct_copy_handles, join_path, next_dir_cursor, normalize_path,
+    temporary_sibling_path, validate_max_dir_entries, validate_port, validate_remote_target,
+    validate_transfer_size,
 };
 use crate::v3::mount::{MOUNT_PROGRAM, MOUNT_VERSION, MountClient};
 use crate::v3::portmap;
@@ -449,10 +450,12 @@ impl Client {
             self.write_handle_all(&handle, 0, data, stable)?;
             self.rename(&temp, path)
         })();
-        if result.is_err() && created {
-            let _ = self.remove(&temp);
-        }
-        result
+        self.finish_with_temp_cleanup(
+            result,
+            created,
+            &temp,
+            "cleanup REMOVE after failed atomic write",
+        )
     }
 
     /// Atomic write by streaming from a local reader.
@@ -511,10 +514,12 @@ impl Client {
             self.rename(&temp, path)?;
             Ok(written)
         })();
-        if result.is_err() && created {
-            let _ = self.remove(&temp);
-        }
-        result
+        self.finish_with_temp_cleanup(
+            result,
+            created,
+            &temp,
+            "cleanup REMOVE after failed atomic reader write",
+        )
     }
 
     /// Appends bytes to an existing file and returns bytes written.
@@ -661,6 +666,7 @@ impl Client {
             }
             Err(err) => return Err(err),
         };
+        ensure_distinct_copy_handles(&source, &target)?;
 
         self.nfs.setattr(&target, &SetAttr::size(0))?;
         self.copy_handles(&source, &target, stable)
@@ -697,7 +703,12 @@ impl Client {
         })();
 
         if result.is_err() && created {
-            let _ = self.remove(&temp);
+            return self.finish_with_temp_cleanup(
+                result,
+                created,
+                &temp,
+                "cleanup REMOVE after failed atomic copy",
+            );
         }
         result
     }
@@ -740,6 +751,20 @@ impl Client {
         result
             .object
             .ok_or_else(|| Error::Protocol("CREATE succeeded without a file handle".into()))
+    }
+
+    fn finish_with_temp_cleanup<T>(
+        &mut self,
+        result: Result<T>,
+        created: bool,
+        temp: &str,
+        cleanup_context: &'static str,
+    ) -> Result<T> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(err) if created => Err(cleanup_error(err, cleanup_context, self.remove(temp))),
+            Err(err) => Err(err),
+        }
     }
 
     /// Creates a directory.
@@ -946,7 +971,7 @@ impl Client {
                 .readdir(&dir, cursor.cookie, cursor.cookieverf, self.dir_size)?,
             Err(err) => return Err(err),
         };
-        dir_page_from_batch(&batch, max_entries)
+        dir_page_from_batch(&batch, cursor.cookie, max_entries)
     }
 
     fn read_dir_with_limit(&mut self, path: &str, max_entries: usize) -> Result<Vec<DirEntry>> {
@@ -970,16 +995,12 @@ impl Client {
                 };
 
             append_dir_entries(&mut entries, &batch, max_entries)?;
-            if batch.eof {
-                break;
-            }
-            if let Some(last) = batch.entries.last() {
-                cookie = last.cookie;
-                cookieverf = batch.cookieverf;
-            } else {
-                return Err(Error::Protocol(
-                    "READDIR returned no entries before EOF".to_owned(),
-                ));
+            match next_dir_cursor(&batch, cookie)? {
+                Some(next) => {
+                    cookie = next.cookie;
+                    cookieverf = next.cookieverf;
+                }
+                None => break,
             }
         }
 
@@ -1063,7 +1084,7 @@ impl Client {
             .unwrap_or(dir_size_limit);
         nfs.set_max_record_size(max_record_size_for_payloads(&[
             read_size, write_size, dir_size,
-        ]));
+        ]))?;
 
         Ok(Self {
             builder: stored_builder,

@@ -1,5 +1,7 @@
 use super::{Error, Result, padding_len};
 
+const MAX_ARRAY_PREALLOC: usize = 1024;
+
 /// Trait for types that can be decoded from XDR.
 pub trait Decode: Sized {
     /// Decodes a value from `decoder`.
@@ -115,7 +117,7 @@ impl<'de> Decoder<'de> {
     /// Reads a variable-length array with a maximum element count.
     pub fn read_array<T: Decode>(&mut self, max: usize) -> Result<Vec<T>> {
         let len = self.read_len(max)?;
-        let mut values = Vec::with_capacity(len);
+        let mut values = Vec::with_capacity(len.min(MAX_ARRAY_PREALLOC));
         for _ in 0..len {
             values.push(T::decode(self)?);
         }
@@ -165,7 +167,10 @@ impl<'de> Decoder<'de> {
 
     fn skip_padding(&mut self, len: usize) -> Result<()> {
         let padding = padding_len(len);
-        self.read_bytes(padding)?;
+        let padding = self.read_bytes(padding)?;
+        if let Some(value) = padding.iter().copied().find(|byte| *byte != 0) {
+            return Err(Error::InvalidPadding { value });
+        }
         Ok(())
     }
 }

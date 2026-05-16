@@ -24,15 +24,16 @@ use crate::retry::RetryPolicy;
 use crate::rpc::{Auth, AuthSys, max_record_size_for_payloads};
 use crate::tokio_rpc::RpcClient;
 use crate::v4::client::{
-    SpaceOp, advance_offset, attrs_require_open_state, dir_page_from_entries, ensure_last_status,
-    ensure_reclaim_complete, finish_with_close, join_path,
-    operations_can_replay_after_session_recovery, path_components, path_ops, response_access,
-    response_commit, response_consumed_owner_seqid, response_create_session, response_exchange_id,
-    response_getattr, response_getfh, response_has_retryable_status, response_open, response_read,
-    response_readdir, response_readlink, response_requires_session_recovery, response_seek,
-    response_write, sequence_succeeded, session_max_operations, session_payload_limit,
-    session_recovery_error, split_parent, temporary_sibling_path,
-    validate_session_compound_operation_count, verifier_from_time,
+    SpaceOp, advance_offset, attrs_require_open_state, cleanup_error, dir_page_from_entries,
+    ensure_distinct_copy_handles, ensure_last_status, ensure_reclaim_complete, finish_with_close,
+    join_path, next_dir_cursor, open_cleanup_error, operations_can_replay_after_session_recovery,
+    path_components, path_ops, response_access, response_commit, response_consumed_owner_seqid,
+    response_create_session, response_exchange_id, response_getattr, response_getfh,
+    response_has_retryable_status, response_open, response_read, response_readdir,
+    response_readlink, response_requires_session_recovery, response_seek, response_write,
+    sequence_succeeded, session_max_operations, session_payload_limit, session_recovery_error,
+    split_parent, temporary_sibling_path, validate_compound_response_shape, validate_open_result,
+    validate_session_channel_attrs, validate_session_compound_operation_count, verifier_from_time,
 };
 use crate::v4::proto::*;
 use crate::v4::{
@@ -265,7 +266,7 @@ impl Client {
     }
 
     pub async fn supported_attrs(&mut self, path: &str) -> Result<Bitmap> {
-        let attrs = Bitmap::from_attrs(&[FATTR4_SUPPORTED_ATTRS]);
+        let attrs = Bitmap::from_known_attrs(&[FATTR4_SUPPORTED_ATTRS]);
         let response = self
             .compound(path_ops(path, vec![Operation::GetAttr(attrs)])?)
             .await?;
@@ -304,7 +305,7 @@ impl Client {
             rebuilt.open_seqid = previous_open_seqid;
         }
         if let Some(fsinfo) = previous_root_fsinfo {
-            rebuilt.apply_fsinfo_limits(&fsinfo);
+            rebuilt.apply_fsinfo_limits(&fsinfo)?;
             rebuilt.root_fsinfo = Some(fsinfo);
         }
         *self = rebuilt;
@@ -420,20 +421,8 @@ impl Client {
         let mut out = Vec::new();
         loop {
             let (eof, data) = self.read_opened_at(opened, offset, self.read_size).await?;
-            if data.len() > self.read_size as usize {
-                return Err(Error::Protocol(format!(
-                    "NFSv4 READ returned {} bytes for a {} byte request",
-                    data.len(),
-                    self.read_size
-                )));
-            }
             if data.is_empty() {
-                if eof {
-                    return Ok(out);
-                }
-                return Err(Error::Protocol(
-                    "NFSv4 READ returned no data before EOF".into(),
-                ));
+                return Ok(out);
             }
             advance_offset(&mut offset, data.len(), "NFSv4 READ")?;
             out.extend_from_slice(&data);
@@ -452,20 +441,8 @@ impl Client {
         let mut total = 0;
         loop {
             let (eof, data) = self.read_opened_at(opened, offset, self.read_size).await?;
-            if data.len() > self.read_size as usize {
-                return Err(Error::Protocol(format!(
-                    "NFSv4 READ returned {} bytes for a {} byte request",
-                    data.len(),
-                    self.read_size
-                )));
-            }
             if data.is_empty() {
-                if eof {
-                    return Ok(total);
-                }
-                return Err(Error::Protocol(
-                    "NFSv4 READ returned no data before EOF".into(),
-                ));
+                return Ok(total);
             }
             writer.write_all(&data).await?;
             advance_offset(&mut offset, data.len(), "NFSv4 READ")?;
@@ -510,19 +487,8 @@ impl Client {
         while remaining > 0 {
             let request = u64::from(self.read_size).min(remaining) as u32;
             let (eof, data) = self.read_opened_at(opened, offset, request).await?;
-            if data.len() > request as usize {
-                return Err(Error::Protocol(format!(
-                    "NFSv4 READ returned {} bytes for a {request} byte request",
-                    data.len()
-                )));
-            }
             if data.is_empty() {
-                if eof {
-                    return Ok(total);
-                }
-                return Err(Error::Protocol(
-                    "NFSv4 READ returned no data before EOF".into(),
-                ));
+                return Ok(total);
             }
             writer.write_all(&data).await?;
             advance_offset(&mut offset, data.len(), "NFSv4 READ")?;
@@ -617,10 +583,13 @@ impl Client {
             Err(err) => Err(err),
         };
 
-        if result.is_err() && created {
-            let _ = self.remove(&temp).await;
-        }
-        result
+        self.finish_with_temp_cleanup(
+            result,
+            created,
+            &temp,
+            "cleanup REMOVE after failed atomic write",
+        )
+        .await
     }
 
     pub async fn write_atomic_from_reader<R: AsyncRead + Unpin + ?Sized>(
@@ -664,10 +633,13 @@ impl Client {
             Err(err) => Err(err),
         };
 
-        if result.is_err() && created {
-            let _ = self.remove(&temp).await;
-        }
-        result
+        self.finish_with_temp_cleanup(
+            result,
+            created,
+            &temp,
+            "cleanup REMOVE after failed atomic reader write",
+        )
+        .await
     }
 
     pub async fn append(&mut self, path: &str, data: &[u8]) -> Result<u64> {
@@ -820,10 +792,23 @@ impl Client {
         {
             Ok(target) => target,
             Err(err) => {
-                let _ = self.close(source).await;
-                return Err(err);
+                return Err(cleanup_error(
+                    err,
+                    "cleanup CLOSE source after failed target OPEN",
+                    self.close(source).await,
+                ));
             }
         };
+
+        if let Err(error) = ensure_distinct_copy_handles(&source.handle, &target.handle) {
+            let target_close = self.close(target).await;
+            let source_close = self.close(source).await;
+            return Err(cleanup_error(
+                error,
+                "cleanup CLOSE after rejected same-file copy",
+                target_close.and(source_close),
+            ));
+        }
 
         let result = match self.set_opened_size(&target, 0).await {
             Ok(()) => self.copy_opened(&source, &target).await,
@@ -831,13 +816,17 @@ impl Client {
         };
         let target_close = self.close(target).await;
         let source_close = self.close(source).await;
+        let close_result = target_close.and(source_close);
         match result {
             Ok(copied) => {
-                target_close?;
-                source_close?;
+                close_result?;
                 Ok(copied)
             }
-            Err(err) => Err(err),
+            Err(err) => Err(cleanup_error(
+                err,
+                "cleanup CLOSE after failed COPY",
+                close_result,
+            )),
         }
     }
 
@@ -862,30 +851,40 @@ impl Client {
         {
             Ok(target) => target,
             Err(err) => {
-                let _ = self.close(source).await;
-                return Err(err);
+                return Err(cleanup_error(
+                    err,
+                    "cleanup CLOSE source after failed atomic target OPEN",
+                    self.close(source).await,
+                ));
             }
         };
 
         let copy_result = self.copy_opened(&source, &target).await;
         let target_close = self.close(target).await;
         let source_close = self.close(source).await;
+        let close_result = target_close.and(source_close);
         let result = match copy_result {
             Ok(copied) => {
-                target_close?;
-                source_close?;
+                close_result?;
                 match self.rename(&temp, to).await {
                     Ok(()) => Ok(copied),
                     Err(err) => Err(err),
                 }
             }
-            Err(err) => Err(err),
+            Err(err) => Err(cleanup_error(
+                err,
+                "cleanup CLOSE after failed atomic COPY",
+                close_result,
+            )),
         };
 
-        if result.is_err() {
-            let _ = self.remove(&temp).await;
-        }
-        result
+        self.finish_with_temp_cleanup(
+            result,
+            true,
+            &temp,
+            "cleanup REMOVE after failed atomic copy",
+        )
+        .await
     }
 
     pub async fn commit(&mut self, path: &str, offset: u64, count: u32) -> Result<CommitResult> {
@@ -916,6 +915,22 @@ impl Client {
             )
             .await?;
         self.close(opened).await
+    }
+
+    async fn finish_with_temp_cleanup<T>(
+        &mut self,
+        result: Result<T>,
+        created: bool,
+        temp: &str,
+        cleanup_context: &'static str,
+    ) -> Result<T> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(err) if created => {
+                Err(cleanup_error(err, cleanup_context, self.remove(temp).await))
+            }
+            Err(err) => Err(err),
+        }
     }
 
     pub async fn mkdir(&mut self, path: &str, mode: u32) -> Result<()> {
@@ -1145,7 +1160,7 @@ impl Client {
             )?)
             .await?;
         let (cookieverf, entries, eof) = response_readdir(&response)?;
-        dir_page_from_entries(cookieverf, entries, eof, max_entries)
+        dir_page_from_entries(cookieverf, entries, eof, cursor.cookie, max_entries)
     }
 
     async fn read_dir_with_limit(
@@ -1173,14 +1188,7 @@ impl Client {
                 )?)
                 .await?;
             let (next_cookieverf, batch, eof) = response_readdir(&response)?;
-            if let Some(last) = batch.last() {
-                cookie = last.cookie;
-            } else if !eof {
-                return Err(Error::Protocol(
-                    "NFSv4 READDIR returned no entries before EOF".into(),
-                ));
-            }
-            cookieverf = next_cookieverf;
+            let next = next_dir_cursor(next_cookieverf, &batch, eof, cookie)?;
             if entries.len().saturating_add(batch.len()) > max_entries {
                 return Err(Error::Protocol(format!(
                     "NFSv4 READDIR exceeded configured limit of {max_entries} entries"
@@ -1192,8 +1200,12 @@ impl Client {
                     .map(DirEntry::from_wire)
                     .collect::<Result<Vec<_>>>()?,
             );
-            if eof {
-                return Ok(entries);
+            match next {
+                Some(next) => {
+                    cookie = next.cookie;
+                    cookieverf = next.cookieverf;
+                }
+                None => return Ok(entries),
             }
         }
     }
@@ -1309,7 +1321,7 @@ impl Client {
             builder.read_size,
             builder.write_size,
             builder.dir_size,
-        ]));
+        ]))?;
 
         let exchange = ExchangeIdArgs {
             client_owner: ClientOwner {
@@ -1346,6 +1358,7 @@ impl Client {
         .await?;
         session_res.ensure_ok()?;
         let session = response_create_session(&session_res)?;
+        validate_session_channel_attrs(&session.fore_channel_attrs)?;
         let max_operations = session_max_operations(&session.fore_channel_attrs)?;
         let max_request_size = session.fore_channel_attrs.max_request_size;
         let max_response_size = session.fore_channel_attrs.max_response_size;
@@ -1394,12 +1407,12 @@ impl Client {
 
     async fn refresh_root_fsinfo(&mut self) -> Result<()> {
         let fsinfo = self.fsinfo("/").await?;
-        self.apply_fsinfo_limits(&fsinfo);
+        self.apply_fsinfo_limits(&fsinfo)?;
         self.root_fsinfo = Some(fsinfo);
         Ok(())
     }
 
-    fn apply_fsinfo_limits(&mut self, fsinfo: &FsInfo) {
+    fn apply_fsinfo_limits(&mut self, fsinfo: &FsInfo) -> Result<()> {
         let read_limit = self
             .builder
             .read_size
@@ -1416,11 +1429,13 @@ impl Client {
         self.read_size = clamp_io_size(fsinfo.max_read, read_limit);
         self.write_size = clamp_io_size(fsinfo.max_write, write_limit);
         self.dir_size = dir_limit;
-        self.rpc.set_max_record_size(max_record_size_for_payloads(&[
-            self.read_size,
-            self.write_size,
-            self.dir_size,
-        ]));
+        self.rpc
+            .set_max_record_size(max_record_size_for_payloads(&[
+                self.read_size,
+                self.write_size,
+                self.dir_size,
+            ]))?;
+        Ok(())
     }
 
     async fn raw_compound(
@@ -1472,10 +1487,30 @@ impl Client {
         response.ensure_ok()?;
         let open = response_open(&response)?;
         let handle = response_getfh(&response)?;
-        Ok(OpenedFile {
+        let opened = OpenedFile {
             handle,
             stateid: open.stateid,
-        })
+        };
+
+        let delegation = match validate_open_result(&open, self.minor_version) {
+            Ok(delegation) => delegation,
+            Err(error) => {
+                let close_result = self.close(opened).await;
+                return Err(open_cleanup_error(error, close_result));
+            }
+        };
+        // The high-level client does not run a callback service, so avoid
+        // keeping delegations that the server granted despite WANT_NO_DELEG.
+        if let Some(delegation_stateid) = delegation
+            && let Err(error) = self
+                .return_open_delegation(&opened.handle, delegation_stateid)
+                .await
+        {
+            let close_result = self.close(opened).await;
+            return Err(open_cleanup_error(error, close_result));
+        }
+
+        Ok(opened)
     }
 
     async fn ensure_directory_type(
@@ -1534,7 +1569,7 @@ impl Client {
 
     async fn supported_attr_request(&mut self, path: &str, attrs: &[u32]) -> Result<Bitmap> {
         let supported = self.supported_attrs(path).await?;
-        Ok(Bitmap::from_supported_attrs(&supported, attrs))
+        Bitmap::from_supported_attrs(&supported, attrs)
     }
 
     async fn get_supported_attr_values(&mut self, path: &str, attrs: &[u32]) -> Result<Fattr> {
@@ -1567,7 +1602,7 @@ impl Client {
                 },
             ])
             .await?;
-        response_read(&response)
+        response_read(&response, count)
     }
 
     async fn seek_opened(
@@ -1604,6 +1639,20 @@ impl Client {
             ])
             .await?;
         self.ensure_status(setattr_response, "SETATTR")
+    }
+
+    async fn return_open_delegation(
+        &mut self,
+        handle: &FileHandle,
+        stateid: StateId,
+    ) -> Result<()> {
+        let response = self
+            .compound(vec![
+                Operation::PutFh(handle.clone()),
+                Operation::DelegReturn(stateid),
+            ])
+            .await?;
+        self.ensure_status(response, "DELEGRETURN")
     }
 
     async fn update_allocation(
@@ -1663,17 +1712,9 @@ impl Client {
                     },
                 ])
                 .await?;
-            let result = response_write(&response)?;
+            let result = response_write(&response, chunk_len as u32)?;
             let written = result.count;
-            if written == 0 {
-                return Err(Error::Protocol("NFSv4 WRITE accepted zero bytes".into()));
-            }
             let written = written as usize;
-            if written > chunk_len {
-                return Err(Error::Protocol(format!(
-                    "NFSv4 WRITE reported {written} bytes for a {chunk_len} byte request"
-                )));
-            }
             if !result.committed.satisfies(StableHow::FileSync) {
                 let commit = self.commit_opened(opened, offset, result.count).await?;
                 if commit.verifier != result.verifier {
@@ -1735,20 +1776,8 @@ impl Client {
         let mut offset = 0;
         loop {
             let (eof, data) = self.read_opened_at(source, offset, self.read_size).await?;
-            if data.len() > self.read_size as usize {
-                return Err(Error::Protocol(format!(
-                    "NFSv4 READ returned {} bytes for a {} byte request",
-                    data.len(),
-                    self.read_size
-                )));
-            }
             if data.is_empty() {
-                if eof {
-                    return Ok(offset);
-                }
-                return Err(Error::Protocol(
-                    "NFSv4 READ returned no data before EOF".into(),
-                ));
+                return Ok(offset);
             }
             self.write_opened_at(target, offset, &data).await?;
             advance_offset(&mut offset, data.len(), "NFSv4 COPY")?;
@@ -1804,6 +1833,10 @@ async fn raw_compound_with_rpc(
     operations: Vec<Operation>,
 ) -> Result<CompoundResponse> {
     let tag = tag.into();
+    let expected = operations
+        .iter()
+        .map(Operation::op_code)
+        .collect::<Vec<_>>();
     let payload = rpc
         .call(
             NFS4_PROGRAM,
@@ -1831,6 +1864,7 @@ async fn raw_compound_with_rpc(
             payload.len()
         ))
     })?;
+    validate_compound_response_shape(&tag, &expected, &response)?;
     Ok(response)
 }
 

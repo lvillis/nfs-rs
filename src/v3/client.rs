@@ -5,7 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, Result};
-use crate::v3::proto::{CookieVerf, FileAttr, MAX_IO_BYTES, MAX_NAME_BYTES, ReadDirResult};
+use crate::v3::proto::{
+    CookieVerf, FileAttr, FileHandle, MAX_IO_BYTES, MAX_NAME_BYTES, ReadDirResult,
+};
 
 /// Parsed NFSv3 target in `host:/export` form.
 ///
@@ -185,25 +187,41 @@ pub(crate) fn append_dir_entries(
     Ok(())
 }
 
-pub(crate) fn dir_page_from_batch(batch: &ReadDirResult, max_entries: usize) -> Result<DirPage> {
+pub(crate) fn dir_page_from_batch(
+    batch: &ReadDirResult,
+    previous_cookie: u64,
+    max_entries: usize,
+) -> Result<DirPage> {
     let mut entries = Vec::new();
     append_dir_entries(&mut entries, batch, max_entries)?;
-    let next_cursor = if batch.eof {
-        None
-    } else {
-        let last = batch
-            .entries
-            .last()
-            .ok_or_else(|| Error::Protocol("READDIR returned no entries before EOF".to_owned()))?;
-        Some(DirPageCursor {
-            cookie: last.cookie,
-            cookieverf: batch.cookieverf,
-        })
-    };
+    let next_cursor = next_dir_cursor(batch, previous_cookie)?;
     Ok(DirPage {
         entries,
         next_cursor,
     })
+}
+
+pub(crate) fn next_dir_cursor(
+    batch: &ReadDirResult,
+    previous_cookie: u64,
+) -> Result<Option<DirPageCursor>> {
+    if batch.eof {
+        return Ok(None);
+    }
+
+    let last = batch
+        .entries
+        .last()
+        .ok_or_else(|| Error::Protocol("READDIR returned no entries before EOF".to_owned()))?;
+    if last.cookie == previous_cookie {
+        return Err(Error::Protocol(format!(
+            "READDIR did not advance directory cookie {previous_cookie}"
+        )));
+    }
+    Ok(Some(DirPageCursor {
+        cookie: last.cookie,
+        cookieverf: batch.cookieverf,
+    }))
 }
 
 pub(crate) fn validate_transfer_size(name: &'static str, size: u32) -> Result<u32> {
@@ -235,6 +253,26 @@ pub(crate) fn clamp_dir_size(preferred: u32, limit: u32) -> u32 {
         limit
     } else {
         preferred.clamp(1, limit)
+    }
+}
+
+pub(crate) fn ensure_distinct_copy_handles(source: &FileHandle, target: &FileHandle) -> Result<()> {
+    if source == target {
+        return Err(Error::Protocol(
+            "copy source and destination refer to the same file handle".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn cleanup_error(
+    error: Error,
+    cleanup_context: &'static str,
+    cleanup_result: Result<()>,
+) -> Error {
+    match cleanup_result {
+        Ok(()) => error,
+        Err(cleanup_error) => Error::cleanup(cleanup_context, error, cleanup_error),
     }
 }
 
@@ -320,7 +358,7 @@ mod tests {
             eof: false,
         };
 
-        let page = dir_page_from_batch(&batch, 16).unwrap();
+        let page = dir_page_from_batch(&batch, 0, 16).unwrap();
         assert_eq!(page.entries.len(), 1);
         assert_eq!(
             page.next_cursor,
@@ -329,6 +367,27 @@ mod tests {
                 cookieverf: [7; 8],
             })
         );
+    }
+
+    #[test]
+    fn rejects_non_advancing_directory_cookies() {
+        let batch = ReadDirResult {
+            directory_attributes: None,
+            cookieverf: [7; 8],
+            entries: vec![crate::v3::proto::DirectoryEntry {
+                fileid: 1,
+                name: "file".to_owned(),
+                cookie: 9,
+                attributes: None,
+                handle: None,
+            }],
+            eof: false,
+        };
+
+        assert!(matches!(
+            dir_page_from_batch(&batch, 9, 16),
+            Err(Error::Protocol(_))
+        ));
     }
 
     #[test]
@@ -356,6 +415,31 @@ mod tests {
             Err(Error::Protocol(_))
         ));
         assert!(validate_max_dir_entries(1).is_ok());
+    }
+
+    #[test]
+    fn rejects_copy_between_equal_file_handles() {
+        let handle = FileHandle::new(vec![1, 2, 3]).unwrap();
+        assert!(matches!(
+            ensure_distinct_copy_handles(&handle, &handle),
+            Err(Error::Protocol(_))
+        ));
+
+        let other = FileHandle::new(vec![1, 2, 4]).unwrap();
+        assert!(ensure_distinct_copy_handles(&handle, &other).is_ok());
+    }
+
+    #[test]
+    fn cleanup_error_preserves_cleanup_failures() {
+        let err = cleanup_error(
+            Error::Protocol("primary failure".to_owned()),
+            "cleanup REMOVE",
+            Err(Error::Protocol("remove failure".to_owned())),
+        );
+
+        let message = err.to_string();
+        assert!(message.contains("primary failure"));
+        assert!(message.contains("remove failure"));
     }
 
     #[test]

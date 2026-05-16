@@ -170,8 +170,10 @@ impl RpcClient {
         Ok(())
     }
 
-    pub fn set_max_record_size(&mut self, max_record_size: usize) {
+    pub fn set_max_record_size(&mut self, max_record_size: usize) -> Result<()> {
+        validate_max_record_size(max_record_size)?;
         self.max_record_size = max_record_size;
+        Ok(())
     }
 
     pub fn call<T: Encode + ?Sized>(
@@ -223,16 +225,29 @@ impl RpcClient {
             let header = u32::from_be_bytes(header_bytes);
             let is_last = (header & LAST_FRAGMENT) != 0;
             let fragment_len = (header & FRAGMENT_LEN_MASK) as usize;
+            if fragment_len == 0 && !is_last {
+                return Err(Error::Protocol(
+                    "RPC record contained zero-length non-final fragment".to_owned(),
+                ));
+            }
 
-            if record.len().saturating_add(fragment_len) > self.max_record_size {
+            let next_len =
+                record
+                    .len()
+                    .checked_add(fragment_len)
+                    .ok_or(Error::RpcRecordTooLarge {
+                        len: usize::MAX,
+                        max: self.max_record_size,
+                    })?;
+            if next_len > self.max_record_size {
                 return Err(Error::RpcRecordTooLarge {
-                    len: record.len().saturating_add(fragment_len),
+                    len: next_len,
                     max: self.max_record_size,
                 });
             }
 
             let start = record.len();
-            record.resize(start + fragment_len, 0);
+            record.resize(next_len, 0);
             self.stream.read_exact(&mut record[start..])?;
 
             if is_last {
@@ -301,10 +316,13 @@ pub(crate) fn decode_reply(expected_xid: u32, reply: &[u8]) -> Result<Vec<u8>> {
     match decoder.read_u32()? {
         REPLY_ACCEPTED => decode_accepted_reply(&mut decoder),
         REPLY_DENIED => decode_denied_reply(&mut decoder),
-        value => Err(Error::RpcDenied {
-            reject_stat: value,
-            detail: 0,
-        }),
+        value => {
+            ensure_rpc_reply_consumed(&decoder)?;
+            Err(Error::RpcDenied {
+                reject_stat: value,
+                detail: 0,
+            })
+        }
     }
 }
 
@@ -319,9 +337,13 @@ fn decode_accepted_reply(decoder: &mut Decoder<'_>) -> Result<Vec<u8>> {
         ACCEPT_PROG_MISMATCH => {
             let low = decoder.read_u32()?;
             let high = decoder.read_u32()?;
+            ensure_rpc_reply_consumed(decoder)?;
             Err(Error::RpcProgramMismatch { low, high })
         }
-        accept_stat => Err(Error::RpcAcceptedError { accept_stat }),
+        accept_stat => {
+            ensure_rpc_reply_consumed(decoder)?;
+            Err(Error::RpcAcceptedError { accept_stat })
+        }
     }
 }
 
@@ -330,19 +352,35 @@ fn decode_denied_reply(decoder: &mut Decoder<'_>) -> Result<Vec<u8>> {
         REJECT_RPC_MISMATCH => {
             let low = decoder.read_u32()?;
             let high = decoder.read_u32()?;
+            ensure_rpc_reply_consumed(decoder)?;
             Err(Error::RpcProgramMismatch { low, high })
         }
         REJECT_AUTH_ERROR => {
             let auth_stat = decoder.read_u32()?;
+            ensure_rpc_reply_consumed(decoder)?;
             Err(Error::RpcDenied {
                 reject_stat: REJECT_AUTH_ERROR,
                 detail: auth_stat,
             })
         }
-        reject_stat => Err(Error::RpcDenied {
-            reject_stat,
-            detail: 0,
-        }),
+        reject_stat => {
+            ensure_rpc_reply_consumed(decoder)?;
+            Err(Error::RpcDenied {
+                reject_stat,
+                detail: 0,
+            })
+        }
+    }
+}
+
+fn ensure_rpc_reply_consumed(decoder: &Decoder<'_>) -> Result<()> {
+    if decoder.is_finished() {
+        Ok(())
+    } else {
+        Err(crate::xdr::Error::TrailingBytes {
+            remaining: decoder.remaining(),
+        }
+        .into())
     }
 }
 
@@ -360,6 +398,15 @@ pub(crate) fn max_record_size_for_payloads(payload_sizes: &[u32]) -> usize {
         .unwrap_or(0)
         .saturating_add(MAX_RECORD_HEADROOM);
     configured.max(DEFAULT_MAX_RECORD_SIZE)
+}
+
+pub(crate) fn validate_max_record_size(max_record_size: usize) -> Result<()> {
+    if max_record_size == 0 {
+        return Err(Error::Protocol(
+            "RPC max_record_size must be greater than zero".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn default_stamp() -> u32 {
@@ -456,7 +503,7 @@ fn normalized_machine_name_len(machine_name: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
 
     #[test]
     fn record_limit_keeps_default_for_small_payloads() {
@@ -475,6 +522,15 @@ mod tests {
     }
 
     #[test]
+    fn rejects_zero_max_record_size() {
+        assert!(matches!(
+            validate_max_record_size(0),
+            Err(Error::Protocol(_))
+        ));
+        assert!(validate_max_record_size(1).is_ok());
+    }
+
+    #[test]
     fn connects_with_configured_timeout() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let addr = listener.local_addr().unwrap();
@@ -487,6 +543,64 @@ mod tests {
                 .unwrap();
         drop(client);
         accept.join().unwrap();
+    }
+
+    #[test]
+    fn rejects_zero_length_nonfinal_record_fragments() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.write_all(&0_u32.to_be_bytes()).unwrap();
+        });
+
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut client = RpcClient::new(stream, Auth::none()).unwrap();
+        let err = client.read_record().unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Protocol(message) if message.contains("zero-length non-final")
+        ));
+        accept.join().unwrap();
+    }
+
+    #[test]
+    fn accepted_error_reply_rejects_trailing_bytes() {
+        let mut reply = rpc_reply_prefix(7, REPLY_ACCEPTED);
+        Auth::None.encode_opaque_auth(&mut reply).unwrap();
+        reply.write_u32(ACCEPT_PROG_MISMATCH);
+        reply.write_u32(1);
+        reply.write_u32(3);
+        reply.write_u32(0);
+
+        assert!(matches!(
+            decode_reply(7, reply.as_slice()).unwrap_err(),
+            Error::Xdr(crate::xdr::Error::TrailingBytes { remaining: 4 })
+        ));
+    }
+
+    #[test]
+    fn denied_reply_rejects_trailing_bytes() {
+        let mut reply = rpc_reply_prefix(7, REPLY_DENIED);
+        reply.write_u32(REJECT_AUTH_ERROR);
+        reply.write_u32(1);
+        reply.write_u32(0);
+
+        assert!(matches!(
+            decode_reply(7, reply.as_slice()).unwrap_err(),
+            Error::Xdr(crate::xdr::Error::TrailingBytes { remaining: 4 })
+        ));
+    }
+
+    #[test]
+    fn unknown_reply_stat_rejects_trailing_bytes() {
+        let mut reply = rpc_reply_prefix(7, 99);
+        reply.write_u32(0);
+
+        assert!(matches!(
+            decode_reply(7, reply.as_slice()).unwrap_err(),
+            Error::Xdr(crate::xdr::Error::TrailingBytes { remaining: 4 })
+        ));
     }
 
     #[test]
@@ -602,5 +716,13 @@ mod tests {
                 .is_empty()
         );
         decoder.finish().unwrap();
+    }
+
+    fn rpc_reply_prefix(xid: u32, reply_stat: u32) -> Encoder {
+        let mut encoder = Encoder::new();
+        encoder.write_u32(xid);
+        encoder.write_u32(MSG_REPLY);
+        encoder.write_u32(reply_stat);
+        encoder
     }
 }

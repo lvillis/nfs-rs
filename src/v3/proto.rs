@@ -793,8 +793,8 @@ impl Nfs3Client {
         self.rpc.set_timeout(timeout)
     }
 
-    pub fn set_max_record_size(&mut self, max_record_size: usize) {
-        self.rpc.set_max_record_size(max_record_size);
+    pub fn set_max_record_size(&mut self, max_record_size: usize) -> Result<()> {
+        self.rpc.set_max_record_size(max_record_size)
     }
 
     pub fn set_retry_policy(&mut self, retry_policy: RetryPolicy) {
@@ -892,6 +892,7 @@ impl Nfs3Client {
     }
 
     pub fn read(&mut self, file: &FileHandle, offset: u64, count: u32) -> Result<ReadResult> {
+        let requested_count = count;
         let payload = self.call(
             NFSPROC3_READ,
             &ReadArgs {
@@ -904,19 +905,14 @@ impl Nfs3Client {
         let status = decode_status(&mut decoder)?;
         let file_attributes = decode_post_op_attr(&mut decoder)?;
         if status == NfsStatus::Ok {
-            let count = u32::decode(&mut decoder)?;
+            let returned_count = u32::decode(&mut decoder)?;
             let eof = bool::decode(&mut decoder)?;
             let data = decoder.read_opaque_vec(MAX_IO_BYTES)?;
             decoder.finish()?;
-            if data.len() != count as usize {
-                return Err(Error::Protocol(format!(
-                    "READ returned count {count} but {} data bytes",
-                    data.len()
-                )));
-            }
+            validate_read_result_size(requested_count, returned_count, data.len(), eof)?;
             Ok(ReadResult {
                 file_attributes,
-                count,
+                count: returned_count,
                 eof,
                 data,
             })
@@ -933,14 +929,14 @@ impl Nfs3Client {
         stable: StableHow,
         data: &[u8],
     ) -> Result<WriteResult> {
-        let count =
+        let requested_count =
             u32::try_from(data.len()).map_err(|_| Error::LengthOutOfRange { len: data.len() })?;
         let payload = self.call(
             NFSPROC3_WRITE,
             &WriteArgs {
                 file,
                 offset,
-                count,
+                count: requested_count,
                 stable,
                 data,
             },
@@ -949,13 +945,14 @@ impl Nfs3Client {
         let status = decode_status(&mut decoder)?;
         let file_wcc = WccData::decode(&mut decoder)?;
         if status == NfsStatus::Ok {
-            let count = u32::decode(&mut decoder)?;
+            let returned_count = u32::decode(&mut decoder)?;
             let committed = StableHow::decode(&mut decoder)?;
             let verifier = decode_writeverf(&mut decoder)?;
             decoder.finish()?;
+            validate_write_result_count(requested_count, returned_count)?;
             Ok(WriteResult {
                 file_wcc,
-                count,
+                count: returned_count,
                 committed,
                 verifier,
             })
@@ -1404,6 +1401,42 @@ pub(crate) fn decode_writeverf(decoder: &mut Decoder<'_>) -> crate::xdr::Result<
         })
 }
 
+pub(crate) fn validate_read_result_size(
+    requested_count: u32,
+    returned_count: u32,
+    data_len: usize,
+    eof: bool,
+) -> Result<()> {
+    if data_len != returned_count as usize {
+        return Err(Error::Protocol(format!(
+            "READ returned count {returned_count} but {data_len} data bytes"
+        )));
+    }
+    if returned_count > requested_count {
+        return Err(Error::Protocol(format!(
+            "READ returned {returned_count} bytes for a {requested_count} byte request"
+        )));
+    }
+    if requested_count > 0 && returned_count == 0 && !eof {
+        return Err(Error::Protocol(
+            "READ returned no data before EOF".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_write_result_count(requested_count: u32, returned_count: u32) -> Result<()> {
+    if returned_count > requested_count {
+        return Err(Error::Protocol(format!(
+            "WRITE reported {returned_count} bytes for a {requested_count} byte request"
+        )));
+    }
+    if requested_count > 0 && returned_count == 0 {
+        return Err(Error::Protocol("WRITE accepted zero bytes".to_owned()));
+    }
+    Ok(())
+}
+
 pub(crate) fn decode_dir_entries(
     decoder: &mut Decoder<'_>,
     plus: bool,
@@ -1703,6 +1736,39 @@ mod tests {
             NfsStatus::Jukebox
         ));
         assert!(!payload_has_status(&[0, 0, 0], NfsStatus::Jukebox));
+    }
+
+    #[test]
+    fn validates_read_result_size_against_request() {
+        assert!(validate_read_result_size(8, 4, 4, false).is_ok());
+        assert!(matches!(
+            validate_read_result_size(8, 4, 3, false),
+            Err(Error::Protocol(_))
+        ));
+        assert!(matches!(
+            validate_read_result_size(4, 8, 8, false),
+            Err(Error::Protocol(_))
+        ));
+        assert!(matches!(
+            validate_read_result_size(8, 0, 0, false),
+            Err(Error::Protocol(_))
+        ));
+        assert!(validate_read_result_size(8, 0, 0, true).is_ok());
+    }
+
+    #[test]
+    fn validates_write_result_count_against_request() {
+        assert!(validate_write_result_count(8, 4).is_ok());
+        assert!(validate_write_result_count(8, 8).is_ok());
+        assert!(validate_write_result_count(0, 0).is_ok());
+        assert!(matches!(
+            validate_write_result_count(4, 8),
+            Err(Error::Protocol(_))
+        ));
+        assert!(matches!(
+            validate_write_result_count(4, 0),
+            Err(Error::Protocol(_))
+        ));
     }
 
     #[test]
